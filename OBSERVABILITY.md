@@ -57,6 +57,10 @@ Variáveis em `observability/.env` (modelo em `observability/.env.example`; o `.
 | `JAEGER_RETENTION` | `168h` | TTL dos traces no Badger (é por quanto tempo os IDs ficam guardados) |
 | `PROMETHEUS_RETENTION` / `PROMETHEUS_RETENTION_SIZE` | `15d` / `2GB` | Retenção das métricas |
 | `PROMETHEUS_PORT` | `9091` | Porta do Prometheus no host (a 9090 é usada pelo cobalt) |
+| `ECONOMY_ANALYTICS_DB_HOST` | `../data/sqlites/analytics.db` | Caminho no host do `analytics.db` do painel da economia (montado só-leitura no Grafana; ver abaixo) |
+
+**Painel da economia** (dashboard **Ravena — Economia**, fonte `Economia (SQLite)`, plugin `frser-sqlite-datasource` 4.0.6 instalado na subida): lê o `analytics.db` que a ravena-ai grava de hora em hora (minuto 5) com `ECONOMY_ANALYTICS_ENABLED=true` (variáveis no `.env.example`, seção 14). Só totais por moeda, motivo e hora, retratos de saldo e faixas (quintos com menos de 10 contas ficam nulos); nenhum dado por jogador. O arquivo precisa existir antes do `up` (senão o Docker cria um diretório no lugar). Anotação de mudança de regra ou correção de extrato (aparece no gráfico de massa):
+`sqlite3 data/sqlites/analytics.db "INSERT INTO annotations (ts, currency, label) VALUES (CAST(strftime('%s','now') AS INTEGER)*1000, 'zinthos', 'Descrição curta')"` (`currency` NULL = todas as moedas).
 
 As UIs ficam sempre em `127.0.0.1` (fixo no compose). Para abrir de outra máquina, use túnel SSH (seção 4).
 
@@ -128,6 +132,7 @@ Versões: o SDK está fixado na linha `@opentelemetry/sdk-node@0.223.x`, a últi
 | `market transfer.runas` / `market transfer.farm` | INTERNAL | dentro de `POST /api/market/transfer` (chamado pelo waifuletes). Contagens (`ravena.market.*`), evento `market.compensation.started`, `ravena.market.compensated` |
 | `fazenda harvest.reconcile` | INTERNAL | dentro de `POST /api/games/fazenda/harvest` (chamado pelo Jardim). `ravena.fazenda.credited_count` |
 | `waifu marry.scheduled` | INTERNAL (raiz) | casamento agendado do `!mu-casar` quando o timer dispara: trace próprio com link para o comando que agendou. `ravena.marry.wait_ms`, `app.outcome` (inclui `already_claimed` e a resposta do waifuletes) |
+| `economy.analytics.run` / `economy.analytics.load` | INTERNAL (raiz) / INTERNAL | carga horária do painel da economia (`ECONOMY_ANALYTICS_ENABLED=true`). Por fonte: `economy.source` (zinthos/petalitas/runas), `economy.window.from`/`to` (epoch ms), `economy.rows`, `economy.unknown_reasons`. Sem ID de usuário |
 | `command mu-foto` (atributos extras) | INTERNAL | `ravena.waifu.photo.requested`/`used`/`total` e `ravena.waifu.photo.fallback` (foto pedida inválida, caiu na padrão) |
 
 **Resultado do comando quando o microsserviço rejeita.** Os hooks de HTTP ligam cada chamada ao waifuletes/Jardim ao span do comando. Se o código do comando não definiu `app.outcome`, vale a última resposta de parceiro a uma **operação mutável** (POST/PUT/PATCH/DELETE). Se o comando só fez leituras, vale a última resposta:
