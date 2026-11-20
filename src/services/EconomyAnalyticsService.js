@@ -75,6 +75,9 @@ const DEFAULT_START_DELAY_MS = 60000;
 // Mesma regra de balances.totalAtWindowEnd no waifuletes (a waifu confiscada nunca creditou o saldo):
 // a massa histórica desconta todo motivo non_monetary do mapeamento (HOSTING_FEE_WAIFU nos Zinthos)
 const massExcludedReasons = (currency) => nonMonetaryReasons(currency);
+/** Intervalos aceitos para o agendamento (horas): cron "5 *\/N * * *". */
+const EVERY_HOURS_PRESETS = [1, 2, 3, 6, 12, 24];
+const cronFor = (h) => (h === 1 ? "5 * * * *" : `5 */${h} * * *`);
 // Intervalo acima do qual a hora de uma mudança automática sem subida do serviço é "aproximada"
 const APPROX_HOUR_MS = 2 * HOUR_MS;
 // Encerramento do bot: no máximo isso esperando a rodada em andamento (o index.js força saída em 25 s)
@@ -364,15 +367,83 @@ class EconomyAnalyticsService {
 		return this.store;
 	}
 
-	start() {
-		if (this.task) return;
-		// Minuto 5: dá tempo das transações da hora anterior assentarem nos serviços
-		this.task = cron.schedule("5 * * * *", () => {
+	/**
+	 * Agendamento em vigor: intervalo (horas) e pausa. Precedência: meta do banco (gravado pelo admin,
+	 * /banco/admin) > ECONOMY_ANALYTICS_EVERY_HOURS > 1 h. Intervalo fora de EVERY_HOURS_PRESETS vira 1.
+	 * defaultEveryHours = o que vale sem a escolha do admin (.env ou 1 h).
+	 * @returns {{everyHours:number, defaultEveryHours:number, paused:boolean, updatedAt:number|null,
+	 *   from:string, cron:string}}
+	 */
+	scheduleState(store = this._getStore()) {
+		const metaHours = Number(store.getMeta("schedule.every_hours"));
+		const envHours = Number(process.env.ECONOMY_ANALYTICS_EVERY_HOURS);
+		const envValid = EVERY_HOURS_PRESETS.includes(envHours);
+		const defaultEveryHours = envValid ? envHours : 1;
+		let everyHours = defaultEveryHours;
+		let from = envValid ? "env" : "padrão";
+		if (EVERY_HOURS_PRESETS.includes(metaHours)) {
+			everyHours = metaHours;
+			from = "admin";
+		}
+		return {
+			everyHours,
+			defaultEveryHours,
+			paused: store.getMeta("schedule.paused") === "1",
+			updatedAt: Number(store.getMeta("schedule.updated_at")) || null,
+			from,
+			cron: cronFor(everyHours)
+		};
+	}
+
+	/**
+	 * Grava o intervalo em vigor em meta (schedule.effective_every_hours), que o painel e o alerta de carga
+	 * atrasada leem: schedule.every_hours só existe quando o admin escolhe, e o intervalo do .env não
+	 * chegaria ao retrato. @returns {boolean} o valor gravado mudou
+	 */
+	_recordEffectiveSchedule(store, state) {
+		const key = "schedule.effective_every_hours";
+		if (store.getMeta(key) === String(state.everyHours)) return false;
+		store.setMeta(key, state.everyHours);
+		return true;
+	}
+
+	/** (Re)cria a tarefa do cron conforme o agendamento; pausado, fica sem tarefa. */
+	_applySchedule(state) {
+		if (this.task) {
+			this.task.stop();
+			this.task = null;
+		}
+		if (state.paused || this._stopping) return;
+		this.task = cron.schedule(state.cron, () => {
 			this.runOnce().catch((err) => logger.error(`[economy] Falha na carga: ${err.message}`));
 		});
+	}
+
+	start() {
+		if (this._started) return;
+		this._started = true;
+		let state;
+		let effectiveChanged = false;
+		try {
+			state = this.scheduleState();
+			const store = this._getStore();
+			// Só republica se já existe retrato (sem ele, a primeira rodada publica)
+			effectiveChanged =
+				this._recordEffectiveSchedule(store, state) &&
+				require("fs").existsSync(store.publishedPath);
+		} catch (err) {
+			// Banco recusado ou ilegível: agenda pelo env; cada rodada vai registrar o erro
+			logger.error(`[economy] Falha ao ler o agendamento: ${err.message}`);
+			const env = Number(process.env.ECONOMY_ANALYTICS_EVERY_HOURS);
+			const h = EVERY_HOURS_PRESETS.includes(env) ? env : 1;
+			state = { everyHours: h, paused: false, cron: cronFor(h) };
+		}
+		// Minuto 5: dá tempo das transações da hora anterior assentarem nos serviços
+		this._applySchedule(state);
 		// Uma rodada logo depois da subida: sem ela, a primeira carga (e o retrato que o Grafana lê) só sai
 		// no minuto 5 da hora seguinte. A carga é incremental, então reiniciar o bot não recarrega nada.
-		if (this.startDelayMs > 0) {
+		// Pausada pelo admin: nem agenda nem roda a da subida.
+		if (this.startDelayMs > 0 && !state.paused) {
 			this._startTimer = setTimeout(() => {
 				this._startTimer = null;
 				this.runOnce().catch((err) =>
@@ -381,17 +452,130 @@ class EconomyAnalyticsService {
 			}, this.startDelayMs);
 			if (this._startTimer.unref) this._startTimer.unref();
 		}
-		this._publishIfSchemaChanged();
+		// Intervalo em vigor mudou (ex.: .env novo) ou schema novo: o retrato reflete já, mesmo pausada
+		this._publishIfSchemaChanged(effectiveChanged);
 		logger.info(
-			`[economy] Carga horária do painel ligada (fontes: ${this.sources.map((s) => s.name).join(", ")}; mapeamento v${MAPPING_VERSION}).`
+			`[economy] Carga do painel ${state.paused ? "PAUSADA" : `ligada a cada ${state.everyHours} h`} (fontes: ${this.sources.map((s) => s.name).join(", ")}; mapeamento v${MAPPING_VERSION}).`
 		);
+	}
+
+	/** Publica o retrato para o Grafana refletir a mudança (estado em meta); falha só vai para o log. */
+	async _publishQuiet() {
+		try {
+			await this._getStore().publish();
+			return true;
+		} catch (err) {
+			logger.warn(`[economy] Falha ao publicar o retrato para o Grafana: ${err.message}`);
+			return false;
+		}
+	}
+
+	/** Grava as chaves de agendamento (null apaga a chave) e reaplica o cron. */
+	_saveSchedule(changes) {
+		const store = this._getStore();
+		for (const [k, v] of Object.entries(changes)) {
+			if (v === null) store.deleteMeta(k);
+			else store.setMeta(k, v);
+		}
+		store.setMeta("schedule.updated_at", this.now());
+		const state = this.scheduleState(store);
+		this._recordEffectiveSchedule(store, state);
+		if (this._started) this._applySchedule(state);
+		return state;
+	}
+
+	/**
+	 * Muda o intervalo (admin). Só os presets de EVERY_HOURS_PRESETS (cron "5 *\/N * * *"); null apaga a
+	 * escolha do admin e volta ao padrão (ECONOMY_ANALYTICS_EVERY_HOURS, ou 1 h).
+	 * @returns {Promise<object>} agendamento em vigor
+	 */
+	async reschedule(everyHours) {
+		const h = everyHours === null ? null : Number(everyHours);
+		if (h !== null && !EVERY_HOURS_PRESETS.includes(h)) {
+			throw new Error(`intervalo inválido: use ${EVERY_HOURS_PRESETS.join(", ")} horas`);
+		}
+		const state = this._saveSchedule({ "schedule.every_hours": h });
+		logger.info(
+			`[economy] Agendamento: a cada ${state.everyHours} h (${state.cron}${h === null ? `, padrão: ${state.from}` : ""}).`
+		);
+		await this._publishQuiet();
+		return state;
+	}
+
+	/** Pausa o agendamento (a rodada em andamento termina normalmente; "rodar agora" continua valendo). */
+	async pause() {
+		if (this._startTimer) {
+			clearTimeout(this._startTimer);
+			this._startTimer = null;
+		}
+		const state = this._saveSchedule({ "schedule.paused": "1" });
+		logger.info("[economy] Agendamento pausado.");
+		await this._publishQuiet();
+		return state;
+	}
+
+	/** Retoma o agendamento. A próxima rodada continua de onde parou, em pedaços (como a primeira carga). */
+	async resume() {
+		const state = this._saveSchedule({ "schedule.paused": "0" });
+		logger.info(`[economy] Agendamento retomado (a cada ${state.everyHours} h).`);
+		await this._publishQuiet();
+		return state;
+	}
+
+	/** Anotações para o admin (id curto; só as possíveis com onlyPossible). */
+	listAnnotations({ onlyPossible = false, limit = 200 } = {}) {
+		const list = this._getStore().listAnnotations({
+			withId: true,
+			origin: onlyPossible ? "possivel" : null
+		});
+		return list.slice(-Math.max(1, Math.min(1000, Number(limit) || 200))).reverse();
+	}
+
+	/**
+	 * Registra uma mudança à mão (admin): texto, moeda (zinthos | petalitas | runas | todas) e hora
+	 * opcional (padrão agora). Nunca sobrescreve uma anotação existente.
+	 */
+	async addManualAnnotation({ text, currency = "todas", ts = null } = {}) {
+		const label = String(text || "").trim();
+		if (!label || label.length > 300) throw new Error("texto obrigatório (até 300 caracteres)");
+		if (!["zinthos", "petalitas", "runas", "todas"].includes(currency)) {
+			throw new Error("moeda inválida");
+		}
+		const when = ts === null || ts === undefined || ts === "" ? this.now() : Number(ts);
+		if (
+			!Number.isFinite(when) ||
+			when < Date.parse("2020-01-01") ||
+			when > this.now() + 30 * DAY_MS
+		) {
+			throw new Error("hora inválida");
+		}
+		const store = this._getStore();
+		if (
+			!store.insertAnnotationIfMissing(
+				when,
+				currency === "todas" ? null : currency,
+				label,
+				"manual"
+			)
+		) {
+			throw new Error("já existe uma anotação com esse texto nessa hora");
+		}
+		const annotation = store.findAnnotation({ ts: when, label });
+		return { annotation, published: await this._publishQuiet() };
+	}
+
+	/** Confirma ou descarta uma possível mudança pelo id (admin). */
+	async decideAnnotation(id, decision, text = null) {
+		const r = this._getStore().decideAnnotation({ id: Number(id) }, decision, text);
+		if (!r.ok) throw new Error(r.error);
+		return { annotation: r.annotation, published: await this._publishQuiet() };
 	}
 
 	/**
 	 * Banco antigo que ganhou tabela ou coluna ao abrir (store.schemaChanged): publica uma vez já, para o
 	 * retrato do Grafana ter o schema novo sem esperar a próxima rodada. Falha só vai para o log.
 	 */
-	_publishIfSchemaChanged() {
+	_publishIfSchemaChanged(force = false) {
 		let store;
 		try {
 			store = this._getStore();
@@ -399,7 +583,7 @@ class EconomyAnalyticsService {
 			logger.error(`[economy] Falha ao abrir o banco da carga: ${err.message}`);
 			return;
 		}
-		if (!store.schemaChanged) return;
+		if (!store.schemaChanged && !force) return;
 		store.schemaChanged = false;
 		// stop() espera esta publicação como espera a rodada (não fecha o banco no meio do backup)
 		this._schemaPublish = store
@@ -419,6 +603,7 @@ class EconomyAnalyticsService {
 	 * se não terminou a tempo, deixa como está (o processo vai sair) para não fechar o banco sob ela.
 	 */
 	async stop() {
+		this._started = false;
 		if (this.task) {
 			this.task.stop();
 			this.task = null;
@@ -476,6 +661,7 @@ class EconomyAnalyticsService {
 			running: !!this._running,
 			runningSince: this._runningSince || null,
 			scheduled: !!this.task,
+			schedule: this.scheduleState(store),
 			sources: this.sources.map((s) => s.name),
 			loads: store.loadStatus(),
 			published,
@@ -502,6 +688,11 @@ class EconomyAnalyticsService {
 	async _run() {
 		const store = this._getStore();
 		const runTs = this.now();
+		try {
+			this._recordEffectiveSchedule(store, this.scheduleState(store));
+		} catch (err) {
+			logger.warn(`[economy] Falha ao gravar o intervalo em vigor: ${err.message}`);
+		}
 		const results = {};
 		for (const source of this.sources) {
 			if (this._stopping) return { ...results, stopped: true };
@@ -1192,3 +1383,4 @@ module.exports = EconomyAnalyticsService;
 module.exports.fetchSummary = fetchSummary;
 module.exports.validateSummary = validateSummary;
 module.exports.validatePlayers = validatePlayers;
+module.exports.EVERY_HOURS_PRESETS = EVERY_HOURS_PRESETS;
