@@ -24,7 +24,7 @@
 const fs = require("fs");
 const path = require("path");
 const BetterSQLite = require("better-sqlite3");
-const { DAY_MS, economicDayStart } = require("./EconomyAnalyticsRunas");
+const { DAY_MS, DAY_OFFSET_MS, economicDayStart } = require("./EconomyAnalyticsRunas");
 
 const ROOT = path.join(__dirname, "../..");
 const DEFAULT_DB_PATH = "data/economia-carga/analytics.db";
@@ -105,6 +105,10 @@ CREATE TABLE IF NOT EXISTS player_activity_daily (
 -- ID cru → pessoa (telefone com 13 dígitos, tg:<id> ou lid:<id>), regravada a cada rodada
 CREATE TABLE IF NOT EXISTS identities (
   player_id TEXT PRIMARY KEY, person TEXT NOT NULL, phone TEXT, id_kind TEXT NOT NULL, name TEXT
+);
+-- Última leitura dos parâmetros de balanceamento de cada serviço (registro automático de mudanças)
+CREATE TABLE IF NOT EXISTS params_current (
+  source TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (source, key)
 );
 -- Painéis que dependem de dado que pode não existir ainda (selo "Indisponível" no painel)
 CREATE TABLE IF NOT EXISTS features (
@@ -358,7 +362,7 @@ class EconomyAnalyticsStore {
 	/**
 	 * Colunas novas em bancos criados por versões anteriores (só ADD COLUMN; nada é apagado).
 	 * annotations.origin: NULL ou 'manual' (economy-annotate), 'auto' (parâmetro de balanceamento mudou),
-	 * 'possivel' (detectada nos dados, a confirmar), 'descartada'; annotations.detail: JSON opcional.
+	 * 'confirmada', 'possivel' (detectada nos dados, a confirmar), 'descartada'; annotations.detail: JSON opcional.
 	 * soulmate_cycle_hourly.without_quota: NULL nas horas de um waifuletes anterior ao campo.
 	 */
 	_migrate() {
@@ -771,6 +775,67 @@ class EconomyAnalyticsStore {
 		return { written, days, from: first };
 	}
 
+	/** Última leitura dos parâmetros de um serviço ({chave: valor}), ou null se nunca leu. */
+	getParams(source) {
+		const rows = this.db
+			.prepare("SELECT key, value FROM params_current WHERE source = ?")
+			.all(source);
+		if (!rows.length) return null;
+		return Object.fromEntries(rows.map((r) => [r.key, JSON.parse(r.value)]));
+	}
+
+	replaceParams(source, params, ts) {
+		const tx = this.db.transaction(() => {
+			this.db.prepare("DELETE FROM params_current WHERE source = ?").run(source);
+			const ins = this.db.prepare(
+				"INSERT INTO params_current (source, key, value, ts) VALUES (?, ?, ?, ?)"
+			);
+			for (const [k, v] of Object.entries(params)) ins.run(source, k, JSON.stringify(v), ts);
+		});
+		tx();
+	}
+
+	/** Linhas por dia econômico e motivo de uma moeda (detecção de possíveis mudanças). */
+	dailyReasonStats(currency, from, to) {
+		return this.db
+			.prepare(
+				`SELECT ((hour - ${DAY_OFFSET_MS}) / ${DAY_MS}) * ${DAY_MS} + ${DAY_OFFSET_MS} AS day, reason,
+				   SUM(tx_count) AS n, SUM(amount_in + amount_out) AS vol
+				 FROM flows_hourly WHERE currency = ? AND hour >= ? AND hour < ? AND kind <> 'non_monetary'
+				 GROUP BY 1, 2`
+			)
+			.all(currency, from, to);
+	}
+
+	reasonLabel(currency, reason) {
+		const r = this.db
+			.prepare("SELECT label FROM reason_labels WHERE currency = ? AND reason = ?")
+			.get(currency, reason);
+		return r ? r.label : reason;
+	}
+
+	/** Anotações 'auto' com ts em [from, to) da moeda ou de todas (currency NULL). */
+	autoAnnotations(currency, from, to) {
+		return this.db
+			.prepare(
+				`SELECT rowid AS id, ts, currency, label FROM annotations
+				 WHERE origin = 'auto' AND ts >= ? AND ts < ? AND (currency = ? OR currency IS NULL)
+				 ORDER BY ts`
+			)
+			.all(from, to, currency);
+	}
+
+	hasAnnotation(ts, label) {
+		return !!this.db.prepare("SELECT 1 FROM annotations WHERE ts = ? AND label = ?").get(ts, label);
+	}
+
+	/** Muda a origem de uma anotação (confirmar ou descartar uma possível mudança). */
+	setAnnotationOrigin(ts, label, origin) {
+		return this.db
+			.prepare("UPDATE annotations SET origin = ? WHERE ts = ? AND label = ?")
+			.run(origin, ts, label).changes;
+	}
+
 	getMeta(key) {
 		const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
 		return row ? row.value : null;
@@ -895,16 +960,89 @@ class EconomyAnalyticsStore {
 		return this.publishedPath;
 	}
 
-	listAnnotations() {
+	/**
+	 * Anotações em ordem de hora. Com withId, cada uma traz `id` (rowid: curto, estável enquanto a
+	 * anotação não é regravada); o --export não leva o id.
+	 * @param {{withId?:boolean, origin?:string}} [opts]
+	 */
+	listAnnotations({ withId = false, origin = null } = {}) {
 		return this.db
-			.prepare("SELECT ts, currency, label, origin, detail FROM annotations ORDER BY ts")
-			.all()
+			.prepare(
+				`SELECT ${withId ? "rowid AS id, " : ""}ts, currency, label, origin, detail FROM annotations
+				 ${origin ? "WHERE origin = ?" : ""} ORDER BY ts`
+			)
+			.all(...(origin ? [origin] : []))
 			.map((a) => ({ ...a, detail: a.detail ? JSON.parse(a.detail) : null }));
 	}
 
 	/** Libera a trava de publicação se ela estiver com este store (encerramento no meio da publicação). */
 	releasePublishLock() {
 		if (this._releaseLock) this._releaseLock();
+	}
+
+	/** Uma anotação pelo id (rowid) ou por (ts, label). */
+	findAnnotation(ref) {
+		const row =
+			ref && ref.id !== undefined && ref.id !== null
+				? this.db
+						.prepare(
+							"SELECT rowid AS id, ts, currency, label, origin, detail FROM annotations WHERE rowid = ?"
+						)
+						.get(Number(ref.id))
+				: this.db
+						.prepare(
+							"SELECT rowid AS id, ts, currency, label, origin, detail FROM annotations WHERE ts = ? AND label = ?"
+						)
+						.get(Number(ref.ts), String(ref.label));
+		return row ? { ...row, detail: row.detail ? JSON.parse(row.detail) : null } : null;
+	}
+
+	/**
+	 * Decide uma possível mudança: 'confirmada' ou 'descartada', com texto novo opcional (o original fica
+	 * no detail.originalLabel). Só vale para anotação detectada nos dados (possivel, ou já decidida):
+	 * manual e automática são recusadas.
+	 * @returns {{ok:true, annotation:object}|{ok:false, error:string}}
+	 */
+	decideAnnotation(ref, decision, text = null) {
+		if (!["confirmada", "descartada"].includes(decision)) {
+			return { ok: false, error: "decisão precisa ser confirmada ou descartada" };
+		}
+		const a = this.findAnnotation(ref);
+		if (!a) return { ok: false, error: "anotação não encontrada" };
+		if (!["possivel", "confirmada", "descartada"].includes(a.origin)) {
+			return {
+				ok: false,
+				error: `anotação ${a.origin === "auto" ? "automática" : "manual"} não se confirma nem descarta`
+			};
+		}
+		const label = text && String(text).trim() ? String(text).trim().slice(0, 300) : a.label;
+		const detail = label !== a.label ? { ...(a.detail || {}), originalLabel: a.label } : a.detail;
+		try {
+			this.db
+				.prepare("UPDATE annotations SET origin = ?, label = ?, detail = ? WHERE rowid = ?")
+				.run(decision, label, detail ? JSON.stringify(detail) : null, a.id);
+		} catch (err) {
+			if (/UNIQUE|constraint/i.test(err.message)) {
+				return { ok: false, error: "já existe uma anotação com esse texto nessa hora" };
+			}
+			throw err;
+		}
+		return { ok: true, annotation: this.findAnnotation({ id: a.id }) };
+	}
+
+	/** Grava uma anotação só se não existir (ts, label); nunca sobrescreve origem nem detalhe. */
+	insertAnnotationIfMissing(ts, currency, label, origin = null, detail = null) {
+		return this.db
+			.prepare(
+				"INSERT OR IGNORE INTO annotations (ts, currency, label, origin, detail) VALUES (?, ?, ?, ?, ?)"
+			)
+			.run(
+				ts,
+				currency || null,
+				label,
+				origin || null,
+				detail === null || detail === undefined ? null : JSON.stringify(detail)
+			).changes;
 	}
 
 	close() {

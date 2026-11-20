@@ -29,6 +29,7 @@ const {
 const { SCHEMA } = require("../services/EconomyAnalyticsStore");
 const R = require("../services/EconomyAnalyticsRunas");
 const EconomyAnalyticsService = require("../services/EconomyAnalyticsService");
+const Changes = require("../services/EconomyAnalyticsChanges");
 
 const H = R.HOUR_MS;
 const D = R.DAY_MS;
@@ -133,6 +134,12 @@ function startMockServer(state) {
 		const isWaifu = req.headers.authorization === "Bearer test-waifu-key";
 		const isJardim = req.headers["x-api-key"] === "test-jardim-key";
 		const svc = isWaifu ? "waifuletes" : isJardim ? "jardim" : null;
+		if (svc && u.pathname === "/internal/economy/params") {
+			const p = state.params && state.params[svc];
+			if (!p) res.writeHead(404).end("{}");
+			else res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(p));
+			return;
+		}
 		if (!svc || u.pathname !== "/internal/economy/summary") {
 			res.writeHead(401).end("{}");
 			return;
@@ -893,7 +900,8 @@ async function main() {
 				ciclo_alma_gemea: 1,
 				atividade: 1,
 				fluxos_petalitas: 0,
-				causa_sem_origem: 0
+				causa_sem_origem: 0,
+				mudancas_automaticas: 1 // Runas: economyConstants.js sempre legível // serviços de mentira sem a rota de parâmetros; BankService fora do bot
 			});
 
 			// Próxima hora: só o dia corrente é refeito, sem duplicar
@@ -1467,6 +1475,47 @@ async function main() {
 			const exported = JSON.parse(r.stdout);
 			assert.strictEqual(exported.length, 1);
 			assert.strictEqual(run(["economy-annotate.js", "x", "ouro"]).status, 1);
+			// --listar, --confirmar e --descartar: pelo id do --listar (ou ts + texto, forma antiga)
+			r = run(["economy-annotate.js", "--listar"]);
+			assert.match(r.stdout, /^\s*\d+\s+\S+\s+manual\s+zinthos\s+Regra nova/m);
+			r = run(["economy-annotate.js", "--descartar", "2026-11-09T12:00:00Z", "Regra nova"]);
+			assert.strictEqual(r.status, 1, "manual não se descarta");
+			assert.match(r.stderr, /manual não se confirma nem descarta/);
+			const T = Date.parse("2026-11-08T07:00:00Z");
+			svc.store.addAnnotation(T, "zinthos", "motivo novo: X (Zinthos)", "possivel", {
+				kind: "new_reason"
+			});
+			svc.store.addAnnotation(T, "runas", "motivo novo: Y (Runas)", "possivel", {
+				kind: "new_reason"
+			});
+			svc.store.addAnnotation(T + 1, null, "ravena: a 1 → 2", "auto", { changes: [] });
+			r = run(["economy-annotate.js", "--listar", "--possiveis"]);
+			const lines = r.stdout.trim().split("\n");
+			assert.strictEqual(lines.length, 2, r.stdout);
+			const idX = lines
+				.find((l) => /X \(Zinthos\)/.test(l))
+				.trim()
+				.split(/\s+/)[0];
+			r = run(["economy-annotate.js", "--descartar", idX]);
+			assert.strictEqual(r.status, 0, r.stderr);
+			r = run(["economy-annotate.js", "--confirmar", idX, "Prêmio X novo no evento"]);
+			assert.strictEqual(r.status, 0, r.stderr);
+			const x = readAll(pubFile, "SELECT origin, label, detail FROM annotations WHERE ts = ?", [T]);
+			assert.deepStrictEqual(x.map((a) => [a.origin, a.label]).sort(), [
+				["confirmada", "Prêmio X novo no evento"],
+				["possivel", "motivo novo: Y (Runas)"]
+			]);
+			assert.strictEqual(
+				JSON.parse(x.find((a) => a.origin === "confirmada").detail).originalLabel,
+				"motivo novo: X (Zinthos)"
+			);
+			r = run(["economy-annotate.js", "--descartar", String(T), "motivo novo: Y (Runas)"]);
+			assert.strictEqual(r.status, 0, r.stderr);
+			r = run(["economy-annotate.js", "--descartar", String(T + 1), "ravena: a 1 → 2"]);
+			assert.match(r.stderr, /automática não se confirma/);
+			assert.strictEqual(run(["economy-annotate.js", "--confirmar", "99999"]).status, 1);
+			assert.strictEqual(run(["economy-annotate.js", "--confirmar"]).status, 1);
+			svc.store.db.prepare("DELETE FROM annotations WHERE ts IN (?, ?)").run(T, T + 1);
 			// Recomeçar do zero e importar de volta
 			const env2 = {
 				...env,
@@ -1489,6 +1538,25 @@ async function main() {
 					"SELECT COUNT(*) n FROM annotations"
 				)[0].n,
 				1
+			);
+			// Importar de novo não sobrescreve origem nem detalhe da que já existe
+			r = spawnSync(
+				process.execPath,
+				[path.join(__dirname, "../../scripts/economy-annotate.js"), "--import"],
+				{
+					env: env2,
+					input: JSON.stringify(exported.map((a) => ({ ...a, origin: "auto", detail: { x: 1 } }))),
+					encoding: "utf8"
+				}
+			);
+			assert.strictEqual(r.status, 0, r.stderr);
+			assert.match(r.stdout, /0 de 1/);
+			assert.deepStrictEqual(
+				readAll(
+					path.join(tmpRoot, "zero-pub", "analytics.db"),
+					"SELECT origin, detail FROM annotations"
+				),
+				[{ origin: "manual", detail: null }]
 			);
 			r = run(["economy-status.js"]);
 			assert.strictEqual(r.status, 0, r.stderr);
@@ -1621,6 +1689,313 @@ async function main() {
 			assert.deepStrictEqual([...new Set(multi(["runas"]).map((x) => x.Moeda))], ["Runas"]);
 		});
 
+		await test("parâmetros: achata, compara, rótulo curto", () => {
+			assert.deepStrictEqual(Changes.flattenParams({ a: { B: 1, C: [2, 3] }, d: null, e: "x" }), {
+				"a.B": 1,
+				"a.C.0": 2,
+				"a.C.1": 3,
+				d: "none",
+				e: "x"
+			});
+			assert.deepStrictEqual(Changes.diffParams(null, { a: 1 }), []); // primeira leitura só guarda
+			const ch = Changes.diffParams({ a: 1, b: 2, gone: 5 }, { a: 1, b: 3, novo: 7 });
+			assert.deepStrictEqual(ch, [
+				{ key: "b", from: 2, to: 3 },
+				{ key: "gone", from: 5, to: null },
+				{ key: "novo", from: null, to: 7 }
+			]);
+			assert.strictEqual(
+				Changes.changeLabel("waifuletes", [{ key: "divorce.RATE", from: 0.05, to: 0.08 }]),
+				"waifuletes: divorce.RATE 0.05 → 0.08"
+			);
+			assert.match(
+				Changes.changeLabel("jardim", ch),
+				/^jardim: 3 parâmetros \(b 2 → 3; gone removido \(era 5\); novo novo \(7\)\)$/
+			);
+			const many = Array.from({ length: 40 }, (_, i) => ({
+				key: `chave.longa.${i}`,
+				from: i,
+				to: i + 1
+			}));
+			const lbl = Changes.changeLabel("waifuletes", many);
+			assert.ok(lbl.length <= 230 && /; \+\d+\)$/.test(lbl), lbl);
+		});
+
+		await test("Runas: parâmetros de economyConstants.js sem carregar o BankService; guarda de constantes", () => {
+			const p = Changes.runasParams();
+			assert.strictEqual(p.params["cambio.BASE_RUNAS_PER_ZINTHOS"], 1000 / 3500);
+			assert.strictEqual(p.params["cotas.DAILY_LIMITS.venda_runas"], 300000);
+			assert.strictEqual(p.params["loja.STORE_PRICES.moeda"], 55);
+			assert.ok(
+				!Object.keys(require.cache).some((k) => k.endsWith(`${path.sep}BankService.js`)),
+				"ler os parâmetros não carrega o BankService (abre bank.db e agenda cron)"
+			);
+			// Guarda: constante de módulo nova no BankService vem de economyConstants.js (vira parâmetro
+			// lido pela carga e anotado sozinho) ou entra aqui com o motivo
+			const IGNORED = {
+				WAIFULETES_URL: "endereço do serviço",
+				WAIFULETES_KEY: "segredo de acesso",
+				SESSION_TTL_MS: "duração da sessão web do banco; não mexe em moeda"
+			};
+			const src = fs.readFileSync(path.join(__dirname, "../services/BankService.js"), "utf8");
+			assert.match(src, /require\("\.\/economyConstants"\)/);
+			const declared = [...src.matchAll(/^const ([A-Z][A-Z0-9_]+)\s*=/gm)].map((m) => m[1]);
+			for (const name of declared) {
+				assert.ok(
+					IGNORED[name],
+					`BankService.js: constante ${name} fora de economyConstants.js; mova para lá (vira parâmetro em /params) ou ignore aqui com o motivo`
+				);
+			}
+			// Tudo que economyConstants exporta (fora as funções e listas internas) sai nos parâmetros
+			const C = require("../services/economyConstants");
+			const keys = Object.keys(p.params);
+			for (const [name, v] of Object.entries(C)) {
+				if (typeof v === "function" || name === "ALL_CURRENCIES_GROUPS") continue;
+				assert.ok(
+					keys.some((k) => k.split(".").includes(name)),
+					`economyConstants.${name} não aparece em economyParams()`
+				);
+			}
+		});
+
+		await test("mudanças automáticas: 1ª leitura guarda, mudança vira anotação na subida do serviço, 404 fica de fora", async () => {
+			let pclock = DAY0 + 5 * D + 2 * H;
+			const st8 = { calls: [], fail: {}, override: {}, now: () => pclock, delay: 0, params: {} };
+			const srv = await startMockServer(st8);
+			const url = `http://127.0.0.1:${srv.address().port}`;
+			let runas = { params: { "loja.STORE_PRICES.isca": 45 }, startedAt: 1, version: null };
+			const s = new EconomyAnalyticsService({
+				dbPath: path.join(tmpRoot, "auto", "a.db"),
+				publishDir: path.join(tmpRoot, "auto-pub"),
+				sources: ["zinthos", "petalitas", "runas"],
+				waifuletesUrl: url,
+				waifuletesKey: "test-waifu-key",
+				jardimUrl: url,
+				jardimKey: "test-jardim-key",
+				now: () => pclock,
+				runasParams: () => runas
+			});
+			try {
+				const st = s._getStore();
+				st8.params.waifuletes = {
+					currency: "zinthos",
+					schemaVersion: 1,
+					generatedAt: pclock,
+					startedAt: DAY0,
+					version: "abc",
+					params: { divorce: { DIVORCE_PENALTY_RATE: 0.05 }, daily: { DAILY_KAKERA_AMOUNT: 100 } }
+				};
+				let r = await s._loadParams(st, pclock);
+				assert.deepStrictEqual(r.jardim, { ok: true, available: false }); // sem a rota
+				assert.strictEqual(r.waifuletes.changes, 0);
+				assert.strictEqual(st.listAnnotations().length, 0);
+				// waifuletes subiu de novo com a taxa nova; a anotação vai para a hora da subida
+				pclock += 3 * H;
+				const up = pclock - 90 * 60 * 1000;
+				st8.params.waifuletes = {
+					...st8.params.waifuletes,
+					startedAt: up,
+					params: { divorce: { DIVORCE_PENALTY_RATE: 0.08 }, daily: { DAILY_KAKERA_AMOUNT: 100 } }
+				};
+				runas = { ...runas, params: { "loja.STORE_PRICES.isca": 50 }, startedAt: 1 };
+				r = await s._loadParams(st, pclock);
+				const anns = st.listAnnotations();
+				assert.deepStrictEqual(
+					anns.map((a) => [a.ts, a.currency, a.origin, a.label]),
+					[
+						[
+							R.hourStart(pclock),
+							"runas",
+							"auto",
+							"ravena: loja.STORE_PRICES.isca 45 → 50 (hora aproximada)"
+						],
+						[up, "zinthos", "auto", "waifuletes: divorce.DIVORCE_PENALTY_RATE 0.05 → 0.08"]
+					].sort((a, b) => a[0] - b[0])
+				);
+				const w = anns.find((a) => a.currency === "zinthos");
+				assert.deepStrictEqual(w.detail.changes, [
+					{ key: "divorce.DIVORCE_PENALTY_RATE", from: 0.05, to: 0.08 }
+				]);
+				assert.strictEqual(w.detail.version, "abc");
+				// Hora exata (subida do serviço); o intervalo e a subida vão sempre no detalhe
+				assert.strictEqual(w.detail.exact, true);
+				assert.deepStrictEqual(w.detail.between, [pclock - 3 * H, pclock]);
+				assert.strictEqual(w.detail.startedAt, up);
+				// Runas: subida antes da leitura anterior → hora cheia, intervalo de 3 h = hora aproximada
+				const rn = anns.find((a) => a.currency === "runas");
+				assert.strictEqual(rn.detail.exact, false);
+				assert.strictEqual(rn.detail.between[1], pclock);
+				// Sem mudança: nada novo
+				pclock += H;
+				await s._loadParams(st, pclock);
+				assert.strictEqual(st.listAnnotations().length, 2);
+				// Chave só acrescentada num deploy (version nova: constante passou a ser exposta): guardada,
+				// sem anotação
+				st8.params.waifuletes = {
+					...st8.params.waifuletes,
+					version: "def",
+					params: {
+						...st8.params.waifuletes.params,
+						roll: { ROLLS_PER_HOUR: 10, CHANCE: 3 }
+					}
+				};
+				pclock += H;
+				r = await s._loadParams(st, pclock);
+				assert.deepStrictEqual([r.waifuletes.changes, r.waifuletes.added], [0, 2]);
+				assert.strictEqual(st.listAnnotations().length, 2);
+				assert.strictEqual(st.getParams("waifuletes")["roll.CHANCE"], 3);
+				// Chave nova com a mesma version (dado mudou sem deploy de código): vira anotação
+				st8.params.waifuletes = {
+					...st8.params.waifuletes,
+					params: { ...st8.params.waifuletes.params, daily: { DAILY_KAKERA_AMOUNT: 100, BONUS: 5 } }
+				};
+				pclock += H;
+				r = await s._loadParams(st, pclock);
+				assert.deepStrictEqual([r.waifuletes.changes, r.waifuletes.added], [1, 1]);
+				assert.ok(
+					st.listAnnotations().some((a) => a.label === "waifuletes: daily.BONUS novo (5)"),
+					JSON.stringify(st.listAnnotations().map((a) => a.label))
+				);
+				// Item novo de catálogo (catalog.*): anotado mesmo com version nova
+				st8.params.waifuletes = {
+					...st8.params.waifuletes,
+					version: "ghi",
+					params: {
+						...st8.params.waifuletes.params,
+						catalog: { plants: { rosa: { price: 10 } } },
+						extra: { K: 1 }
+					}
+				};
+				pclock += H;
+				r = await s._loadParams(st, pclock);
+				assert.deepStrictEqual([r.waifuletes.changes, r.waifuletes.added], [1, 2]);
+				const cat = st.listAnnotations().find((a) => /catalog/.test(a.label));
+				assert.strictEqual(cat.label, "waifuletes: catalog.plants.rosa.price novo (10)");
+				assert.deepStrictEqual(cat.detail.added, [{ key: "extra.K", from: null, to: 1 }]);
+				assert.strictEqual(st.listAnnotations().length, 4);
+				// Formato novo (schemaVersion mudou): só regrava a base, sem anotar
+				st8.params.waifuletes = {
+					...st8.params.waifuletes,
+					schemaVersion: 2,
+					params: { outro: { FORMATO: 1 } }
+				};
+				pclock += H;
+				r = await s._loadParams(st, pclock);
+				assert.strictEqual(r.waifuletes.changes, 0);
+				assert.strictEqual(st.listAnnotations().length, 4);
+				assert.deepStrictEqual(st.getParams("waifuletes"), { "outro.FORMATO": 1 });
+				// Câmbio das Runas mexe em todas as moedas: anotação em "todas", hora menos de 2 h → sem aviso
+				runas = { ...runas, params: { ...runas.params, "cambio.BASE_RUNAS_PER_ZINTHOS": 0.3 } };
+				pclock += H;
+				await s._loadParams(st, pclock); // acrescentada: só guarda
+				runas = { ...runas, params: { ...runas.params, "cambio.BASE_RUNAS_PER_ZINTHOS": 0.25 } };
+				pclock += H;
+				await s._loadParams(st, pclock);
+				const cam = st.listAnnotations().find((a) => /cambio/.test(a.label));
+				assert.strictEqual(cam.currency, null);
+				assert.strictEqual(cam.label, "ravena: cambio.BASE_RUNAS_PER_ZINTHOS 0.3 → 0.25");
+				// Falha de um serviço não para os outros
+				st8.params.waifuletes = { nope: true };
+				r = await s._loadParams(st, pclock);
+				assert.strictEqual(r.waifuletes.ok, false);
+				assert.strictEqual(r.ravena.ok, true);
+			} finally {
+				await s.stop();
+				srv.close();
+			}
+		});
+
+		await test("possíveis mudanças: motivo novo, motivo que sumiu e valor por transação; uma vez por dia", () => {
+			const D0 = DAY0 + 40 * D;
+			const rows = [];
+			for (let i = 1; i <= 10; i++) {
+				const d = D0 - i * D;
+				rows.push({ day: d, reason: "DAILY", n: 30, vol: 30 * (100 + (i % 2)) });
+				rows.push({ day: d, reason: "OLD", n: 5, vol: 50 });
+				rows.push({ day: d, reason: "ROLL", n: 30, vol: 30 * (i % 2 ? 50 : 150) }); // instável: não conta
+			}
+			rows.push({ day: D0, reason: "DAILY", n: 40, vol: 40 * 300 });
+			rows.push({ day: D0, reason: "ROLL", n: 30, vol: 30 * 400 });
+			rows.push({ day: D0, reason: "NEW", n: 2, vol: 999 });
+			const found = Changes.detectPossible(rows, D0, (r) => `L_${r}`);
+			assert.deepStrictEqual(
+				found.map((f) => f.label),
+				[
+					"valor por transação de L_DAILY: 101 → 300 (+198%)",
+					"motivo novo: L_NEW",
+					"motivo sumiu: L_OLD"
+				]
+			);
+			// No serviço: só com extrato, só com o dia carregado, uma vez por dia, sem regravar decisão
+			const s = new EconomyAnalyticsService({
+				dbPath: path.join(tmpRoot, "poss", "a.db"),
+				publishDir: path.join(tmpRoot, "poss-pub"),
+				sources: ["zinthos", "petalitas", "runas"]
+			});
+			const st = s._getStore();
+			const fl = st.db.prepare("INSERT INTO flows_hourly VALUES (?, ?, ?, 'creation', ?, 0, ?, 1)");
+			// O mesmo motivo nas duas moedas, no mesmo dia: as duas anotações entram
+			for (const cur of ["zinthos", "runas"]) {
+				for (const r of rows) fl.run(r.day + H, cur, r.reason, r.vol, r.n);
+				// Histórico de 35 dias: sem ele, "motivo novo" não é dito
+				fl.run(D0 - 35 * D + H, cur, "DAILY", 3000, 30);
+				st.setLedgerStatus(cur, true, 0);
+			}
+			st.setLedgerStatus("petalitas", false, 0);
+			const runTs = D0 + D + 2 * H;
+			assert.deepStrictEqual(s._detectChanges(st, runTs), {}); // dia ainda não carregado
+			st.recordRun({ ts: 1, source: "zinthos", ok: true, from: 0, to: D0 + D + H, rows: 1 });
+			st.recordRun({ ts: 1, source: "runas", ok: true, from: 0, to: D0 + D + H, rows: 1 });
+			assert.deepStrictEqual(s._detectChanges(st, runTs), { zinthos: 3, runas: 3 });
+			assert.strictEqual(st.listAnnotations().length, 6);
+			assert.ok(st.listAnnotations().every((a) => a.origin === "possivel" && a.ts === D0));
+			st.setAnnotationOrigin(D0, "motivo novo: NEW (Zinthos)", "descartada");
+			st.db.prepare("DELETE FROM meta WHERE key = 'detect_day:zinthos'").run();
+			st.db.prepare("DELETE FROM meta WHERE key = 'detect_day:runas'").run();
+			s._detectChanges(st, runTs); // rodar de novo não desfaz o descarte
+			assert.strictEqual(
+				st.listAnnotations().find((a) => a.label === "motivo novo: NEW (Zinthos)").origin,
+				"descartada"
+			);
+			assert.deepStrictEqual(s._detectChanges(st, runTs + H), {}); // já olhou esse dia
+			// Detecção pura: sem 35 dias de histórico não há "motivo novo"
+			assert.ok(
+				!Changes.detectPossible(rows, D0, (r) => r, Changes.DETECT, { allowNew: false }).some(
+					(f) => f.detail.kind === "new_reason"
+				)
+			);
+			// Dia sem dados (serviço fora: total muito abaixo da mediana) não emite nada
+			assert.strictEqual(Changes.isLowDataDay(rows, D0 + D), true);
+			assert.strictEqual(
+				Changes.isLowDataDay([...rows, { day: D0 + D, reason: "DAILY", n: 3, vol: 300 }], D0 + D),
+				true
+			);
+			assert.strictEqual(Changes.isLowDataDay(rows, D0), false);
+			// Ravena parada 3 dias: olha cada dia pulado; valor por transação no dia de uma mudança
+			// automática da mesma moeda já entra descartado com a referência
+			const D3 = D0 + 3 * D;
+			for (let i = -10; i <= 3; i++) {
+				const d = D0 + i * D;
+				fl.run(d + 2 * H, "zinthos", "STEADY", 30 * (i === 3 ? 200 : 100), 30);
+				if (i > 0) fl.run(d + H, "zinthos", "DAILY", 30 * 300, 30);
+			}
+			st.addAnnotation(D3 + 5 * H, "zinthos", "waifuletes: steady.X 100 → 200", "auto", {});
+			st.recordRun({ ts: 2, source: "zinthos", ok: true, from: 0, to: D3 + D + H, rows: 1 });
+			const before = st.listAnnotations().length;
+			s._detectChanges(st, D3 + D + 2 * H);
+			assert.strictEqual(Number(st.getMeta("detect_day:zinthos")), D3);
+			const shift = st
+				.listAnnotations()
+				.slice(before)
+				.concat(st.listAnnotations())
+				.find((a) => a.ts === D3 && a.detail && a.detail.kind === "per_tx_shift");
+			assert.ok(shift, "valor por transação no dia da mudança automática");
+			assert.strictEqual(shift.origin, "descartada");
+			assert.strictEqual(shift.detail.ref.label, "waifuletes: steady.X 100 → 200");
+			st.close();
+			s.store = null;
+		});
+
 		await test("banco antigo: annotations ganha origin e detail sem perder linhas", () => {
 			const wdb = path.join(tmpRoot, "antigo", "a.db");
 			fs.mkdirSync(path.dirname(wdb), { recursive: true });
@@ -1667,10 +2042,33 @@ async function main() {
 				"INSERT INTO annotations (ts, currency, label, origin) VALUES (?, 'zinthos', 'motivo novo', 'possivel')"
 			).run(T + 2 * D + 3 * H);
 			db.close();
-			const rows = readAll(
-				file,
-				dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
-			);
+			const ficha = () =>
+				readAll(
+					file,
+					dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
+				);
+			if (AUTO_CHANGES) {
+				// Possível ainda a decidir fica fora da ficha, na tabela própria com o id do --confirmar/--descartar
+				assert.deepStrictEqual(
+					ficha().map((r) => r["O que mudou"]),
+					["DAILY 100 → 300"]
+				);
+				const [aDecidir] = readAll(
+					file,
+					dashboardSql("Possíveis mudanças a decidir", { from: 0, to: T + 30 * D })
+				);
+				assert.strictEqual(aDecidir["O que pode ter mudado"], "motivo novo");
+				assert.strictEqual(
+					aDecidir["Decidir com economy-annotate.js"],
+					`--confirmar ${aDecidir.Id}  ·  --descartar ${aDecidir.Id}`
+				);
+				const dbc = new BetterSQLite(file);
+				dbc
+					.prepare("UPDATE annotations SET origin = 'confirmada' WHERE rowid = ?")
+					.run(aDecidir.Id);
+				dbc.close();
+			}
+			const rows = ficha();
 			assert.strictEqual(rows.length, 2);
 			const [poss, auto] = rows;
 			if (AUTO_CHANGES) assert.strictEqual(auto.Origem, "automática");
@@ -1682,8 +2080,8 @@ async function main() {
 			assert.match(auto["Motivos que mais mudaram"], /Divórcio \+\d+\/dia/);
 			assert.ok(auto["Semanas no normal"] >= 7);
 			if (AUTO_CHANGES) {
-				assert.strictEqual(poss.Origem, "possível");
-				assert.strictEqual(poss["Situação"], "cedo demais (< 1 dia) · confirmar?");
+				assert.strictEqual(poss.Origem, "possível, confirmada");
+				assert.strictEqual(poss["Situação"], "cedo demais (< 1 dia)");
 			} else {
 				assert.strictEqual(poss.Origem, undefined);
 				assert.strictEqual(poss["Situação"], "cedo demais (< 1 dia)");
@@ -2331,7 +2729,11 @@ async function main() {
 						`${p.title}: coluna em snake_case ${m[1]}`
 					);
 				}
-				if (!/Últimas mudanças|Confiança|Disponibilidade|Ficha de antes e depois/.test(p.title)) {
+				if (
+					!/Últimas mudanças|Confiança|Disponibilidade|Ficha de antes e depois|Possíveis mudanças/.test(
+						p.title
+					)
+				) {
 					assert.match(
 						p.title,
 						/últimos 7 dias|12 semanas|período selecionado|retrato mais recente|últimas 50|agora/,

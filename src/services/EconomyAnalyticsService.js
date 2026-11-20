@@ -59,6 +59,7 @@ const {
 	runasPlayerDay,
 	readActivity
 } = require("./EconomyAnalyticsPlayers");
+const Changes = require("./EconomyAnalyticsChanges");
 
 const logger = new Logger("economy-analytics");
 const SCHEMA_VERSION = 1;
@@ -74,6 +75,8 @@ const DEFAULT_START_DELAY_MS = 60000;
 // Mesma regra de balances.totalAtWindowEnd no waifuletes (a waifu confiscada nunca creditou o saldo):
 // a massa histórica desconta todo motivo non_monetary do mapeamento (HOSTING_FEE_WAIFU nos Zinthos)
 const massExcludedReasons = (currency) => nonMonetaryReasons(currency);
+// Intervalo acima do qual a hora de uma mudança automática sem subida do serviço é "aproximada"
+const APPROX_HOUR_MS = 2 * HOUR_MS;
 // Encerramento do bot: no máximo isso esperando a rodada em andamento (o index.js força saída em 25 s)
 const STOP_WAIT_MS = 3000;
 
@@ -245,6 +248,8 @@ class EconomyAnalyticsService {
 					? delay
 					: DEFAULT_START_DELAY_MS;
 		this._startTimer = null;
+		// Parâmetros das Runas (testes injetam; senão, economyConstants.js, o mesmo que o BankService usa)
+		this.runasParams = opts.runasParams || Changes.runasParams;
 	}
 
 	static isEnabled() {
@@ -520,6 +525,17 @@ class EconomyAnalyticsService {
 				logger.warn(`[economy] Falha ao regravar identidades: ${err.message}`);
 			}
 		}
+		if (this._stopping) return { ...results, stopped: true };
+		try {
+			results.params = await this._loadParams(store, runTs);
+		} catch (err) {
+			logger.warn(`[economy] Falha ao ler parâmetros de balanceamento: ${err.message}`);
+		}
+		try {
+			results.possiveis = this._detectChanges(store, runTs);
+		} catch (err) {
+			logger.warn(`[economy] Falha ao procurar possíveis mudanças: ${err.message}`);
+		}
 		try {
 			this._writeFeatures(store, runTs);
 		} catch (err) {
@@ -656,6 +672,217 @@ class EconomyAnalyticsService {
 			);
 		}
 		return r.written;
+	}
+
+	/**
+	 * Parâmetros de balanceamento: compara com a leitura anterior de cada serviço e registra o que mudou
+	 * como anotação automática (origin 'auto'). A primeira leitura só guarda. Serviço sem a rota (404)
+	 * fica de fora sem erro. Chave acrescentada (valor novo sem antigo) vira anotação quando a version do
+	 * serviço é a mesma da leitura anterior (dado ou catálogo mudou sem deploy de código) ou quando começa
+	 * com "catalog." (item novo de catálogo, relido a quente); com version nova ou sem version, é o deploy
+	 * passando a expor constantes, nada mudou no jogo: vai só para a base, o log e o detail. Leitura com
+	 * schemaVersion diferente da anterior (formato mudou) só regrava a base.
+	 *
+	 * Hora: a mudança aconteceu em (leitura anterior, esta leitura]. Se o serviço subiu nesse intervalo
+	 * (startedAt), é a hora exata; senão vai para a hora cheia da leitura, nunca antes da leitura anterior,
+	 * e o rótulo ganha "(hora aproximada)" quando o intervalo passa de 2 h. O detalhe sempre leva o
+	 * intervalo (between) e o startedAt. Mudança de câmbio das Runas é anotada em "todas" (mexe também em
+	 * Zinthos e Petalitas).
+	 */
+	async _loadParams(store, runTs) {
+		const readers = [];
+		for (const src of this.sources) {
+			if (src.name === "zinthos") {
+				readers.push({
+					service: "waifuletes",
+					currency: "zinthos",
+					read: () =>
+						Changes.fetchParams(
+							this.waifuletes.url,
+							{ Authorization: `Bearer ${this.waifuletes.key}` },
+							this.timeoutMs,
+							this._abort && this._abort.signal
+						)
+				});
+			} else if (src.name === "petalitas") {
+				readers.push({
+					service: "jardim",
+					currency: "petalitas",
+					read: () =>
+						Changes.fetchParams(
+							this.jardim.url,
+							{ "x-api-key": this.jardim.key },
+							this.timeoutMs,
+							this._abort && this._abort.signal
+						)
+				});
+			} else if (src.name === "runas") {
+				readers.push({
+					service: "ravena",
+					currency: "runas",
+					allCurrencies: Changes.RUNAS_ALL_CURRENCIES_PREFIXES,
+					read: async () => this.runasParams()
+				});
+			}
+		}
+		const out = {};
+		for (const r of readers) {
+			if (this._stopping) break;
+			try {
+				const got = await r.read();
+				// Teto do intervalo da mudança: o instante em que a leitura voltou
+				const readAt = this.now();
+				if (!got || got.missing) {
+					store.setMeta(`params_available:${r.service}`, 0);
+					out[r.service] = { ok: true, available: false };
+					continue;
+				}
+				const prev = store.getParams(r.service);
+				const prevTs = Number(store.getMeta(`params_ts:${r.service}`)) || 0;
+				const prevSchema = store.getMeta(`params_schema:${r.service}`);
+				const schema =
+					got.schemaVersion === null || got.schemaVersion === undefined
+						? null
+						: String(got.schemaVersion);
+				const schemaChanged = prevSchema !== null && schema !== null && prevSchema !== schema;
+				const prevVersion = store.getMeta(`params_version:${r.service}`);
+				const all = Changes.diffParams(prev, got.params);
+				const added = all.filter((c) => c.from === null);
+				// Chave nova vira anotação quando é mudança de dado sem deploy de código (mesma version da
+				// leitura anterior, conhecida) ou item de catálogo (catalog.*, relido a quente no Jardim);
+				// com version nova ou desconhecida é o deploy passando a expor constantes: só log e detail
+				const sameVersion = !!got.version && prevVersion === got.version;
+				const addedNoted = added.filter((c) => sameVersion || c.key.startsWith("catalog."));
+				const addedQuiet = added.filter((c) => !addedNoted.includes(c));
+				const changes = schemaChanged
+					? []
+					: [...all.filter((c) => c.from !== null), ...addedNoted].sort((a, b) =>
+							a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+						);
+				if (schemaChanged) {
+					logger.info(
+						`[economy] ${r.service}: formato dos parâmetros mudou (schemaVersion ${prevSchema} → ${schema}); base regravada sem anotar.`
+					);
+				} else if (addedQuiet.length) {
+					logger.info(
+						`[economy] ${r.service}: ${addedQuiet.length} parâmetro(s) passaram a ser expostos (${addedQuiet
+							.map((c) => c.key)
+							.join(", ")
+							.slice(0, 300)}); só guardados, sem anotação.`
+					);
+				}
+				if (changes.length) {
+					const exact = !!got.startedAt && got.startedAt > prevTs && got.startedAt <= readAt;
+					const ts = exact
+						? got.startedAt
+						: Math.min(readAt, Math.max(prevTs + 1, hourStart(readAt)));
+					const approx = !exact && readAt - prevTs > APPROX_HOUR_MS;
+					const currency =
+						r.allCurrencies && changes.some((c) => r.allCurrencies.some((p) => c.key.startsWith(p)))
+							? null
+							: r.currency;
+					store.addAnnotation(
+						ts,
+						currency,
+						`${Changes.changeLabel(r.service, changes)}${approx ? " (hora aproximada)" : ""}`,
+						"auto",
+						{
+							service: r.service,
+							version: got.version,
+							changes,
+							...(addedQuiet.length ? { added: addedQuiet } : {}),
+							between: [prevTs || null, readAt],
+							startedAt: got.startedAt || null,
+							exact
+						}
+					);
+					logger.info(
+						`[economy] ${r.service}: ${changes.length} parâmetro(s) de balanceamento mudaram; anotação registrada.`
+					);
+				}
+				if (!prev || all.length) store.replaceParams(r.service, got.params, readAt);
+				store.setMeta(`params_ts:${r.service}`, readAt);
+				if (schema !== null) store.setMeta(`params_schema:${r.service}`, schema);
+				store.setMeta(`params_version:${r.service}`, got.version || "");
+				store.setMeta(`params_available:${r.service}`, 1);
+				out[r.service] = {
+					ok: true,
+					available: true,
+					changes: changes.length,
+					added: added.length
+				};
+			} catch (err) {
+				out[r.service] = { ok: false, error: err.message };
+				logger.warn(`[economy] ${r.service}: leitura de parâmetros falhou (${err.message}).`);
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Possíveis mudanças, uma vez por dia econômico e moeda com extrato: olha cada dia completo já
+	 * carregado desde o último olhado (detect_day; no máximo DETECT.lookbackDays para trás, e só o último
+	 * na primeira vez), procurando motivo novo, motivo que sumiu e valor por transação fora do normal, e
+	 * registra cada achado como anotação 'possivel' no início do dia. Dia sem dados (total de transações
+	 * 0 ou bem abaixo da mediana dos 28 dias antes: serviço fora, extrato incompleto) não emite nada.
+	 * Motivo novo só com DETECT.lookbackDays de histórico. Valor por transação no mesmo dia de uma mudança
+	 * automática da mesma moeda já entra descartado, com a referência (é efeito dela). Nunca reescreve uma
+	 * anotação que já existe (confirmada ou descartada continua como está).
+	 */
+	_detectChanges(store, runTs) {
+		const lastDay = economicDayStart(hourStart(runTs)) - DAY_MS;
+		const look = Changes.DETECT.lookbackDays;
+		const out = {};
+		for (const src of this.sources) {
+			if (!store.getLedgerAvailable(src.currency)) continue;
+			const key = `detect_day:${src.currency}`;
+			const loaded = store.getLastSuccessfulTo(src.name);
+			if (loaded === null) continue;
+			// Último dia completo com os dados já carregados
+			const last = Math.min(lastDay, economicDayStart(loaded) - DAY_MS);
+			const seen = Number(store.getMeta(key)) || null;
+			let day = seen ? seen + DAY_MS : last;
+			day = Math.max(day, last - (look - 1) * DAY_MS);
+			const nome = { zinthos: "Zinthos", petalitas: "Petalitas", runas: "Runas" }[src.currency];
+			for (; day <= last; day += DAY_MS) {
+				const rows = store.dailyReasonStats(src.currency, day - look * DAY_MS, day + DAY_MS);
+				const first = rows.reduce((m, x) => Math.min(m, Number(x.day)), Infinity);
+				let found = [];
+				// Sem histórico mínimo (carga recente) ou dia sem dados: nada a dizer
+				if (first <= day - Changes.DETECT.steadyDays * DAY_MS && !Changes.isLowDataDay(rows, day)) {
+					found = Changes.detectPossible(
+						rows,
+						day,
+						(reason) => store.reasonLabel(src.currency, reason),
+						Changes.DETECT,
+						{ allowNew: first <= day - look * DAY_MS }
+					);
+				}
+				const autos = found.length ? store.autoAnnotations(src.currency, day, day + DAY_MS) : [];
+				// A moeda vai no rótulo: (ts, rótulo) é a chave, e o mesmo motivo pode existir em duas moedas
+				for (const f of found) {
+					const label = `${f.label} (${nome})`;
+					if (store.hasAnnotation(day, label)) continue;
+					const auto = f.detail.kind === "per_tx_shift" && autos[0];
+					store.addAnnotation(
+						day,
+						src.currency,
+						label,
+						auto ? "descartada" : "possivel",
+						auto
+							? {
+									...f.detail,
+									dismissed: "mudança automática no mesmo dia",
+									ref: { id: auto.id, ts: auto.ts, label: auto.label }
+								}
+							: f.detail
+					);
+				}
+				store.setMeta(key, day);
+				out[src.currency] = (out[src.currency] || 0) + found.length;
+			}
+		}
+		return out;
 	}
 
 	/** Primeiro dia econômico guardado no detalhe por jogador. */
@@ -824,6 +1051,21 @@ class EconomyAnalyticsService {
 					title: "Fluxos de Petalitas",
 					available: store.getLedgerAvailable("petalitas") === true,
 					dependsOn: "extrato do Jardim (fase 2)"
+				},
+				{
+					key: "mudancas_automaticas",
+					title: "Mudanças automáticas (parâmetros de balanceamento)",
+					available: ["waifuletes", "jardim", "ravena"].some(
+						(n) => store.getMeta(`params_available:${n}`) === "1"
+					),
+					dependsOn:
+						"rota /internal/economy/params no waifuletes e no Jardim; economyConstants.js (Runas)",
+					detail: ["waifuletes", "jardim", "ravena"]
+						.map(
+							(n) =>
+								`${n}: ${store.getMeta(`params_available:${n}`) === "1" ? "lendo" : "sem leitura"}`
+						)
+						.join(", ")
 				},
 				{
 					key: "causa_sem_origem",
