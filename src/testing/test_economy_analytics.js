@@ -156,6 +156,8 @@ function startMockServer(state) {
 		if (state.override[svc]) Object.assign(body, state.override[svc](body));
 		res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
 	});
+	// Testes de SQL entre duas cargas podem passar dos 5 s padrão: o fetch reusaria um socket já fechado (ECONNRESET)
+	server.keepAliveTimeout = 120000;
 	return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
 
@@ -171,15 +173,60 @@ function readAll(file, sql, params = []) {
 const DASHBOARD = path.join(__dirname, "../../observability/grafana/dashboards/economia.json");
 const DASHBOARD_JOGADORES = path.join(
 	__dirname,
-	"../../observability/grafana/dashboards/jogadores.json"
+	"../../observability/grafana/dashboards/jogador.json"
 );
+const REPO_ROOT = path.join(__dirname, "../..");
+// Com as mudanças automáticas (EconomyAnalyticsChanges.js) a ficha ganha a coluna Origem e "confirmar?"
+const AUTO_CHANGES = fs.existsSync(path.join(REPO_ROOT, "src/services/EconomyAnalyticsChanges.js"));
+
+/** Painéis do dashboard (formato v2 do Grafana: spec.elements), num formato plano para os testes. */
 function dashboardPanels(file = DASHBOARD) {
 	const dash = JSON.parse(fs.readFileSync(file, "utf8"));
-	return dash.panels.flatMap((p) => (p.panels ? [p, ...p.panels] : [p]));
+	return Object.entries(dash.spec.elements).map(([name, el]) => ({
+		name,
+		id: el.spec.id,
+		title: el.spec.title,
+		type: el.spec.vizConfig.group,
+		description: el.spec.description,
+		fieldConfig: el.spec.vizConfig.spec.fieldConfig,
+		options: el.spec.vizConfig.spec.options,
+		timeFrom: el.spec.data.spec.queryOptions.timeFrom,
+		targets: el.spec.data.spec.queries.map((q) => ({ refId: q.spec.refId, ...q.spec.query.spec }))
+	}));
+}
+
+/** Abas → seções → nomes dos elementos, na ordem do layout. */
+function dashboardLayout(file = DASHBOARD) {
+	const dash = JSON.parse(fs.readFileSync(file, "utf8"));
+	const grid = (l) => l.spec.items.map((i) => i.spec.element.name);
+	const sections = (l) =>
+		l.kind === "RowsLayout"
+			? l.spec.rows.map((r) => ({
+					title: r.spec.title,
+					collapse: r.spec.collapse,
+					conditional: r.spec.conditionalRendering || null,
+					elements: grid(r.spec.layout)
+				}))
+			: [{ title: null, collapse: false, conditional: null, elements: grid(l) }];
+	const root = dash.spec.layout;
+	const tabs =
+		root.kind === "TabsLayout" ? root.spec.tabs : [{ spec: { title: null, layout: root } }];
+	return tabs.map((t) => ({ title: t.spec.title, sections: sections(t.spec.layout) }));
 }
 
 /** Consulta de um painel com a interpolação que o frontend faz ($__from/$__to em ms, ${moeda}). */
-function dashboardSql(title, { from, to, moeda = "zinthos", jogador = "", file = DASHBOARD }) {
+function dashboardSql(
+	title,
+	{
+		from,
+		to,
+		moeda = "zinthos",
+		moedas = ["zinthos", "petalitas", "runas"],
+		escala = "indice",
+		jogador = "",
+		file = DASHBOARD
+	}
+) {
 	const panel = dashboardPanels(file).find((p) => p.title === title);
 	assert.ok(panel, `painel "${title}" não encontrado`);
 	return panel.targets[0].queryText
@@ -187,6 +234,8 @@ function dashboardSql(title, { from, to, moeda = "zinthos", jogador = "", file =
 		.replace(/\$__to\b/g, String(to))
 		.replace(/\$\{moeda:sqlstring\}/g, `'${moeda}'`)
 		.replace(/\$\{moeda\}/g, moeda)
+		.replace(/\$\{moedas:sqlstring\}/g, moedas.map((m) => `'${m}'`).join(","))
+		.replace(/\$\{escala\}/g, escala)
 		.replace(/\$\{jogador:sqlstring\}/g, `'${jogador.replace(/'/g, "''")}'`)
 		.replace(/\$\{jogador\}/g, jogador)
 		.replace(/\$\{busca:sqlstring\}/g, `'${jogador.replace(/'/g, "''")}'`);
@@ -883,11 +932,11 @@ async function main() {
 				DAY0 + 2 * D
 			);
 
-			// Painéis da página Jogadores rodam no retrato publicado, com e sem jogador escolhido
+			// Painéis da ficha do jogador rodam no retrato publicado, com e sem jogador escolhido
 			const pubP = path.join(ppub, "analytics.db");
 			let n = 0;
 			for (const p of dashboardPanels(DASHBOARD_JOGADORES)) {
-				if (!p.targets) continue;
+				if (!p.targets.length) continue;
 				for (const moeda of ["zinthos", "petalitas", "runas"]) {
 					for (const jogador of ["", PHONE, "x'; DROP TABLE players; --"]) {
 						readAll(
@@ -904,10 +953,10 @@ async function main() {
 				}
 				n++;
 			}
-			assert.ok(n >= 6, `esperava >= 6 painéis na página Jogadores, achou ${n}`);
+			assert.ok(n >= 6, `esperava >= 6 painéis na ficha do jogador, achou ${n}`);
 			// Painéis da economia continuam rodando com as tabelas novas (ciclo, ficha, atividade, em preparação)
 			for (const p of dashboardPanels()) {
-				if (!p.targets) continue;
+				if (!p.targets.length) continue;
 				readAll(pubP, dashboardSql(p.title, { from: DAY0 - D, to: pclock, moeda: "zinthos" }));
 			}
 		} finally {
@@ -1092,7 +1141,7 @@ async function main() {
 			);
 			const v = readAll(
 				dbPath,
-				dashboardSql("Veredito por moeda (últimos 7 dias)", { from: 0, to: clock })
+				dashboardSql("Situação por moeda (últimos 7 dias)", { from: 0, to: clock })
 			);
 			const pet = v.find((x) => x.Moeda === "Petalitas");
 			assert.match(pet["Situação"], /sem extrato/);
@@ -1218,7 +1267,7 @@ async function main() {
 			st.writeBalance("zinthos", anchor, { total: 1000, holders: 3 });
 			const so = st.db
 				.prepare(
-					dashboardSql("Sem origem por dia — Zinthos (período selecionado)", {
+					dashboardSql("Conferência: estoque × fluxos — ${moeda} (período selecionado)", {
 						from: DAY0 - D,
 						to: anchor + D
 					})
@@ -1530,7 +1579,7 @@ async function main() {
 			const range = { from: DAY0 - D, to: DAY0 + 6 * D };
 			const z = readAll(
 				file,
-				dashboardSql("Sem origem por dia — Zinthos (período selecionado)", range)
+				dashboardSql("Conferência: estoque × fluxos — ${moeda} (período selecionado)", range)
 			);
 			assert.deepStrictEqual(
 				z.map((r) => [r.time, r["Sem origem"], r["% da massa"], r["Dias no intervalo"]]),
@@ -1542,7 +1591,10 @@ async function main() {
 			);
 			const r = readAll(
 				file,
-				dashboardSql("Sem origem por dia — Runas (período selecionado)", range)
+				dashboardSql("Conferência: estoque × fluxos — ${moeda} (período selecionado)", {
+					...range,
+					moeda: "runas"
+				})
 			);
 			assert.deepStrictEqual(
 				r.map((x) => x["Sem origem"]),
@@ -1550,12 +1602,173 @@ async function main() {
 			);
 			const p = readAll(
 				file,
-				dashboardSql("Sem origem por dia — Petalitas (período selecionado)", range)
+				dashboardSql("Conferência: estoque × fluxos — ${moeda} (período selecionado)", {
+					...range,
+					moeda: "petalitas"
+				})
 			);
 			assert.strictEqual(p.length, 0);
+			// Gráfico com várias moedas: o filtro Moedas põe e tira séries
+			const multi = (moedas) =>
+				readAll(
+					file,
+					dashboardSql("Sem origem por dia, por moeda (período selecionado)", { ...range, moedas })
+				);
+			assert.deepStrictEqual([...new Set(multi(["zinthos", "runas"]).map((x) => x.Moeda))].sort(), [
+				"Runas",
+				"Zinthos"
+			]);
+			assert.deepStrictEqual([...new Set(multi(["runas"]).map((x) => x.Moeda))], ["Runas"]);
 		});
 
-		await test("veredito por moeda: situação pelo pior critério, dobra em N semanas, % do criado", () => {
+		await test("banco antigo: annotations ganha origin e detail sem perder linhas", () => {
+			const wdb = path.join(tmpRoot, "antigo", "a.db");
+			fs.mkdirSync(path.dirname(wdb), { recursive: true });
+			const old = new BetterSQLite(wdb);
+			old.exec(
+				"CREATE TABLE annotations (ts INTEGER NOT NULL, currency TEXT, label TEXT NOT NULL, PRIMARY KEY (ts, label))"
+			);
+			old.prepare("INSERT INTO annotations VALUES (1, 'zinthos', 'antiga')").run();
+			old.close();
+			const s = new EconomyAnalyticsService({
+				dbPath: wdb,
+				publishDir: path.join(tmpRoot, "antigo-pub"),
+				sources: []
+			});
+			const st = s._getStore();
+			st.addAnnotation(2, null, "nova", "auto", { de: 1, para: 2 });
+			assert.deepStrictEqual(st.listAnnotations(), [
+				{ ts: 1, currency: "zinthos", label: "antiga", origin: null, detail: null },
+				{ ts: 2, currency: null, label: "nova", origin: "auto", detail: { de: 1, para: 2 } }
+			]);
+			st.close();
+			s.store = null;
+		});
+
+		await test("ficha de mudanças: faixa do normal, situação, motivos que mais mudaram e origem", () => {
+			const { file, db } = freshDb("mudancas.db");
+			const fl = db.prepare("INSERT INTO flows_hourly VALUES (?, 'zinthos', ?, ?, ?, ?, 1, 1)");
+			const T = DAY0 + 70 * D;
+			// 9 semanas antes: 700 por semana com ±10% alternado; depois: 3 dias com 300/dia e um motivo novo
+			for (let w = 1; w <= 9; w++) {
+				fl.run(T - w * 7 * D + H, "DAILY_REWARD", "creation", w % 2 ? 770 : 630, 0);
+			}
+			for (let d = 0; d < 3; d++) {
+				fl.run(T + d * D + H, "DAILY_REWARD", "creation", 300, 0);
+				fl.run(T + d * D + 2 * H, "DIVORCE", "creation", 50, 0);
+			}
+			db.prepare(
+				"INSERT INTO reason_labels VALUES ('zinthos', 'DIVORCE', 'Divórcio', 'creation')"
+			).run();
+			db.prepare(
+				"INSERT INTO annotations (ts, currency, label, origin) VALUES (?, 'zinthos', 'DAILY 100 → 300', 'auto')"
+			).run(T);
+			db.prepare(
+				"INSERT INTO annotations (ts, currency, label, origin) VALUES (?, 'zinthos', 'motivo novo', 'possivel')"
+			).run(T + 2 * D + 3 * H);
+			db.close();
+			const rows = readAll(
+				file,
+				dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
+			);
+			assert.strictEqual(rows.length, 2);
+			const [poss, auto] = rows;
+			if (AUTO_CHANGES) assert.strictEqual(auto.Origem, "automática");
+			assert.strictEqual(auto["Situação"], "acompanhando (2 de 7 dias)");
+			assert.strictEqual(auto["Criado/dia antes"], 110); // 770 / 7
+			// depois: 1050 em 2,04 dias (última hora carregada = T + 2 d + 2 h + 1 h)
+			// ficha ainda aberta: Δ parcial, sem ▲▼ nem cor
+			assert.match(auto["Criado/dia: Δ"], /^parcial: \+\d+\.\d%$/);
+			assert.match(auto["Motivos que mais mudaram"], /Divórcio \+\d+\/dia/);
+			assert.ok(auto["Semanas no normal"] >= 7);
+			if (AUTO_CHANGES) {
+				assert.strictEqual(poss.Origem, "possível");
+				assert.strictEqual(poss["Situação"], "cedo demais (< 1 dia) · confirmar?");
+			} else {
+				assert.strictEqual(poss.Origem, undefined);
+				assert.strictEqual(poss["Situação"], "cedo demais (< 1 dia)");
+			}
+			// Ficha fechada: recurso desligado depois da mudança (nenhuma linha de criação) → criado 0, ▼ −100%;
+			// normal = média de |Δ%| entre semanas seguidas (770/630 alternados ≈ 20%).
+			// Jogadores/dia = média dos distintos de cada dia (2 e 1 → 1,5), não distintos da semana ÷ 7.
+			const { file: f4, db: db4 } = freshDb("mudancas-fechada.db");
+			const fl4 = db4.prepare("INSERT INTO flows_hourly VALUES (?, 'zinthos', ?, ?, ?, ?, 1, 1)");
+			for (let w = 1; w <= 9; w++) {
+				fl4.run(T - w * 7 * D + H, "DAILY_REWARD", "creation", w % 2 ? 770 : 630, 0);
+			}
+			const pd4 = db4.prepare(
+				"INSERT INTO player_daily VALUES (?, 'zinthos', ?, 'DAILY_REWARD', 'creation', 1, 0, 1)"
+			);
+			pd4.run(T - 2 * D, "A");
+			pd4.run(T - 2 * D, "B");
+			pd4.run(T - D, "A");
+			pd4.run(T + D, "A");
+			db4.prepare("INSERT INTO ledger_status VALUES ('zinthos', 1, 0)").run();
+			db4
+				.prepare(
+					"INSERT INTO load_runs (ts, source, ok, window_from, window_to, rows) VALUES (1, 'zinthos', 1, 0, ?, 1)"
+				)
+				.run(T + 10 * D);
+			db4
+				.prepare(
+					"INSERT INTO annotations (ts, currency, label) VALUES (?, 'zinthos', 'desligou o diário')"
+				)
+				.run(T);
+			db4.close();
+			const [fech] = readAll(
+				f4,
+				dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
+			);
+			assert.strictEqual(fech["Situação"], "fechada");
+			assert.strictEqual(fech["Criado/dia depois"], 0);
+			assert.strictEqual(fech["Criado/dia: Δ"], "▼ -100.0% (normal ±20%)");
+			assert.strictEqual(fech["Jogadores/dia antes"], 1.5);
+			assert.strictEqual(fech["Jogadores/dia depois"], 1);
+			assert.deepStrictEqual(Object.keys(fech).slice(0, 5), [
+				"Quando",
+				"O que mudou",
+				"Criado/dia: Δ",
+				"Situação",
+				"Motivos que mais mudaram"
+			]);
+			// Pouco histórico (3 semanas → 2 comparações): o normal diz com quantas semanas foi medido
+			const db5 = new BetterSQLite(f4);
+			db5.prepare("DELETE FROM flows_hourly WHERE hour < ?").run(T - 3 * 7 * D);
+			db5.close();
+			const [curta] = readAll(
+				f4,
+				dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
+			);
+			assert.match(curta["Criado/dia: Δ"], /^▼ -100\.0% \(normal ±\d+%, 2 semanas\)$/);
+			// Moeda sem extrato (Petalitas): o "depois" avança pela carga registrada, não fica "cedo demais"
+			const { file: f3, db: db3 } = freshDb("mudancas-pet.db");
+			db3
+				.prepare(
+					"INSERT INTO annotations (ts, currency, label, origin) VALUES (?, 'petalitas', 'jardim: x 1 → 2', 'auto')"
+				)
+				.run(T);
+			db3
+				.prepare(
+					"INSERT INTO load_runs (ts, source, ok, window_from, window_to, rows) VALUES (1, 'petalitas', 1, 0, ?, 1)"
+				)
+				.run(T + 3 * D);
+			db3.close();
+			const pet = readAll(
+				f3,
+				dashboardSql("Ficha de antes e depois (últimas 20)", { from: 0, to: T + 30 * D })
+			);
+			assert.strictEqual(pet[0]["Situação"], "acompanhando (3 de 7 dias)");
+			// Sem nenhuma mudança: a consulta volta vazia e o painel mostra o texto de estado vazio
+			const { file: f2 } = freshDb("mudancas-vazio.db");
+			assert.deepStrictEqual(
+				readAll(f2, dashboardSql("Últimas mudanças (3)", { from: 0, to: T })),
+				[]
+			);
+			const resumo = dashboardPanels().find((p) => p.title === "Últimas mudanças (3)");
+			assert.match(resumo.fieldConfig.defaults.noValue, /Nenhuma mudança registrada ainda/);
+		});
+
+		await test("situação por moeda: pior critério, dobra em N semanas, % do criado, conhecido, atrasado", () => {
 			const { file, db } = freshDb("veredito.db");
 			const insL = db.prepare(
 				"INSERT INTO reason_labels (currency, reason, label, kind) VALUES (?, ?, ?, ?)"
@@ -1583,6 +1796,11 @@ async function main() {
 			// Petalitas: sem extrato, massa estável → ok · sem extrato
 			db.prepare("INSERT INTO ledger_status VALUES ('petalitas', 0, 0)").run();
 			for (let d = 0; d <= 8; d++) bal.run(DAY0 + d * D, "petalitas", 7000);
+			// Carga em dia (1 h atrás) nas três fontes
+			const lr = db.prepare(
+				"INSERT INTO load_runs (ts, source, ok, window_from, window_to, rows) VALUES (1, ?, 1, 0, ?, 1)"
+			);
+			for (const c of ["zinthos", "petalitas", "runas"]) lr.run(c, Date.now() - 3600000);
 			db.close();
 			// Variante: Zinthos só com 3 dias de retrato (sem base de 7 a 9 dias) e um motivo sem mapear
 			fs.copyFileSync(file, path.join(tmpRoot, "veredito2.db"));
@@ -1592,7 +1810,7 @@ async function main() {
 				.prepare("INSERT INTO flows_hourly VALUES (?, 'zinthos', 'NOVO', 'unknown', 3, 0, 1, 1)")
 				.run(DAY0 + 6 * D);
 			db2.close();
-			const v = readAll(file, dashboardSql("Veredito por moeda (últimos 7 dias)", { from: 0, to }));
+			const v = readAll(file, dashboardSql("Situação por moeda (últimos 7 dias)", { from: 0, to }));
 			const by = Object.fromEntries(v.map((x) => [x.Moeda, x]));
 			assert.deepStrictEqual(
 				v.map((x) => x.Moeda),
@@ -1610,16 +1828,16 @@ async function main() {
 			assert.strictEqual(by.Runas["Sem origem (% do criado)"], 6);
 			assert.strictEqual(by.Runas["Sem origem (% da massa)"], 0.012);
 			assert.strictEqual(by.Runas["Sem origem"], "6.00% do criado"); // o critério pior (% do criado)
-			assert.strictEqual(by.Runas["Dobra em (semanas)"], 5776.6);
+			assert.strictEqual(by.Runas["Dobra em (semanas)"], null); // crescimento < 0,5%/semana: sem "dobra em"
 			assert.strictEqual(by.Runas["Maior fonte"], "Venda de peixe");
 			assert.strictEqual(by.Petalitas["Situação"], "ok · sem extrato");
 			assert.strictEqual(by.Petalitas["Sem origem (% do criado)"], null);
-			assert.strictEqual(by.Petalitas["Dados até"], (DAY0 + 8 * D) / 1000);
+			assert.match(by.Petalitas["Dados até · atraso"], /^\d\d\/\d\d \d\d:\d\d · 1\.0 h$/);
 			assert.strictEqual(by.Petalitas["Por quê"], "—");
 			// Sem retrato de 7 a 9 dias atrás: crescimento "sem dados", sem "dobra em"; motivo sem mapear → atenção
 			const v2 = readAll(
 				path.join(tmpRoot, "veredito2.db"),
-				dashboardSql("Veredito por moeda (últimos 7 dias)", { from: 0, to })
+				dashboardSql("Situação por moeda (últimos 7 dias)", { from: 0, to })
 			);
 			const z2 = v2.find((x) => x.Moeda === "Zinthos");
 			assert.strictEqual(z2["Crescimento (%)"], null);
@@ -1632,6 +1850,133 @@ async function main() {
 			);
 			assert.strictEqual(conf.find((x) => x.Fonte === "Zinthos")["Motivos sem mapear (7 dias)"], 2); // NOVO_Z e NOVO
 			assert.strictEqual(conf.find((x) => x.Fonte === "Runas")["Motivos sem mapear (7 dias)"], 0);
+		});
+
+		await test("situação por moeda: buraco conhecido fica em atenção; acima da própria base, agir; carga velha, atrasado", () => {
+			// Runas: 10 semanas de retrato diário; cada dia a massa sobe 11 e o extrato só explica 10 → sem origem = 10% do
+			// criado, todo dia (buraco conhecido). Variante: na última semana sobe 12 (20%, acima da própria base).
+			const build = (name, ultima) => {
+				const { file, db } = freshDb(name);
+				const bal = db.prepare("INSERT INTO balances (ts, currency, total) VALUES (?, 'runas', ?)");
+				const fl = db.prepare(
+					"INSERT INTO flows_hourly VALUES (?, 'runas', 'DEPOSIT:pesca', 'creation', 10, 0, 1, 1)"
+				);
+				let total = 1000000;
+				db.transaction(() => {
+					for (let d = 0; d <= 70; d++) {
+						bal.run(DAY0 + d * D, total);
+						fl.run(DAY0 + d * D + H);
+						total += 10 + (d >= 63 ? ultima : 1);
+					}
+				})();
+				db.prepare(
+					"INSERT INTO load_runs (ts, source, ok, window_from, window_to, rows) VALUES (1, 'runas', 1, 0, ?, 1)"
+				).run(Date.now() - (name.includes("velha") ? 5 : 1) * 3600000);
+				db.close();
+				const v = readAll(
+					file,
+					dashboardSql("Situação por moeda (últimos 7 dias)", { from: 0, to: DAY0 + 70 * D })
+				);
+				return v.find((x) => x.Moeda === "Runas");
+			};
+			const conhecido = build("conhecido.db", 1);
+			assert.strictEqual(conhecido["Sem origem (% do criado)"], 10);
+			assert.strictEqual(conhecido["Situação"], "atenção · conhecido");
+			assert.strictEqual(conhecido["Por quê"], "sem origem (na faixa das 8 semanas)");
+			const acima = build("acima.db", 2);
+			assert.strictEqual(acima["Situação"], "agir");
+			assert.strictEqual(acima["Por quê"], "sem origem");
+			assert.strictEqual(conhecido.Carga, "ativa a cada 1 h");
+			const velha = build("velha.db", 1);
+			assert.strictEqual(velha["Situação"], "dados atrasados");
+			assert.match(velha["Por quê"], /carga atrasada$/);
+			// Carga a cada 6 h: 5 h de atraso ainda é normal; pausada: nunca atrasada
+			const db6 = new BetterSQLite(path.join(tmpRoot, "velha.db"));
+			db6.prepare("INSERT INTO meta VALUES ('schedule.every_hours', '6')").run();
+			db6.close();
+			const sit = (f) =>
+				readAll(
+					path.join(tmpRoot, f),
+					dashboardSql("Situação por moeda (últimos 7 dias)", { from: 0, to: DAY0 + 70 * D })
+				).find((x) => x.Moeda === "Runas");
+			assert.strictEqual(sit("velha.db")["Situação"], "atenção · conhecido");
+			assert.strictEqual(sit("velha.db").Carga, "ativa a cada 6 h");
+			// Intervalo em vigor gravado pela carga (admin > .env > 1) vale sobre a escolha do admin
+			const dbe = new BetterSQLite(path.join(tmpRoot, "velha.db"));
+			dbe.prepare("INSERT INTO meta VALUES ('schedule.effective_every_hours', '12')").run();
+			assert.strictEqual(sit("velha.db").Carga, "ativa a cada 12 h");
+			dbe.prepare("DELETE FROM meta WHERE key = 'schedule.effective_every_hours'").run();
+			dbe.close();
+			const dbp = new BetterSQLite(path.join(tmpRoot, "velha.db"));
+			dbp.prepare("UPDATE meta SET value = '1' WHERE key = 'schedule.every_hours'").run();
+			dbp.prepare("INSERT INTO meta VALUES ('schedule.paused', '1')").run();
+			dbp
+				.prepare("INSERT INTO meta VALUES ('schedule.updated_at', ?)")
+				.run(String(Date.parse("2026-11-19T15:30:00Z")));
+			dbp.close();
+			assert.strictEqual(sit("velha.db")["Situação"], "atenção · conhecido");
+			assert.strictEqual(sit("velha.db").Carga, "pausada desde 19/11 12:30");
+		});
+
+		await test("ciclo da alma gêmea: sem cotas à parte (NULL = desconhecido) e % sobre os com cotas", () => {
+			const { file, db } = freshDb("alma.db");
+			db.prepare(
+				"INSERT INTO features (key, title, available, ts) VALUES ('ciclo_alma_gemea', 'Ciclo', 1, 0)"
+			).run();
+			db.prepare(
+				"INSERT INTO soulmate_cycle_hourly (hour, divorces, paid, quota_cost, above_cost, max_return) VALUES (?, 5, 100, 50, 2, 2)"
+			).run(DAY0 + H);
+			db.close();
+			const range = { from: DAY0 - D, to: DAY0 + D };
+			const dia = () =>
+				readAll(file, dashboardSql("Ciclo da alma gêmea por dia (período selecionado)", range))[0];
+			const semCotas = () =>
+				readAll(file, dashboardSql("Divórcios de alma gêmea sem cotas (últimos 7 dias)", range))[0][
+					"Sem cotas"
+				];
+			// without_quota NULL (waifuletes antigo): sem cotas desconhecido, % sobre os 5
+			assert.strictEqual(dia()["Sem cotas"], null);
+			assert.strictEqual(dia()["% dos com cotas"], 40);
+			assert.strictEqual(dia()["Pagou mais que as cotas"], 2);
+			assert.strictEqual(semCotas(), "desconhecido");
+			// 1 dos 5 sem cotas → 2 de 4
+			const db2 = new BetterSQLite(file);
+			db2.prepare("UPDATE soulmate_cycle_hourly SET without_quota = 1").run();
+			db2.close();
+			assert.strictEqual(dia()["Sem cotas"], 1);
+			assert.strictEqual(dia()["% dos com cotas"], 50);
+			assert.strictEqual(semCotas(), "1");
+		});
+
+		await test("alerta de carga atrasada: só fontes das últimas 48 h, intervalo + 2 h, pausada não dispara", () => {
+			const rules = JSON.parse(
+				fs
+					.readFileSync(
+						path.join(REPO_ROOT, "observability/grafana/provisioning/alerting/economia.yaml"),
+						"utf8"
+					)
+					.replace(/^#.*$/gm, "")
+			).groups[0].rules;
+			const r = rules.find((x) => x.uid === "economia-carga-atrasada");
+			assert.strictEqual(r.data[2].model.conditions[0].evaluator.params[0], 0);
+			const { file, db } = freshDb("alerta-carga.db");
+			const lr = db.prepare(
+				"INSERT INTO load_runs (ts, source, ok, window_from, window_to, rows) VALUES (1, ?, 1, 0, ?, 1)"
+			);
+			lr.run("zinthos", Date.now() - 5 * 3600000);
+			lr.run("petalitas", Date.now() - 5 * 86400000); // desligada há dias: fora
+			lr.run("runas", Date.now() - 3600000);
+			db.close();
+			const v = () => Object.values(readAll(file, r.data[0].model.queryText)[0])[0];
+			assert.ok(Math.abs(v() - 2) < 0.05, `5 h de atraso − 3 h de limite: ${v()}`);
+			const db2 = new BetterSQLite(file);
+			db2.prepare("INSERT INTO meta VALUES ('schedule.every_hours', '6')").run();
+			db2.close();
+			assert.ok(v() < 0);
+			const db3 = new BetterSQLite(file);
+			db3.prepare("INSERT INTO meta VALUES ('schedule.paused', '1')").run();
+			db3.close();
+			assert.strictEqual(v(), 0);
 		});
 
 		await test("de onde vem e para onde vai: top 8 por |líquido| + Outros, sem mapear sempre aparece", () => {
@@ -1652,7 +1997,7 @@ async function main() {
 				rows.map((r) => r.Motivo),
 				["R12", "R11", "R10", "R9", "R8", "R7", "R6", "R5", "MISTERIO", "Outros (4 motivos)"]
 			);
-			assert.strictEqual(rows[9]["Líquido"], 100 + 200 + 300 + 400);
+			assert.strictEqual(rows[9]["Líquido"], "+1,000"); // texto neutro com sinal: 100 + 200 + 300 + 400
 		});
 
 		await test("totais: criado/destruído só com creation/destruction; câmbio e transferência à parte; nomes legíveis", () => {
@@ -1712,9 +2057,16 @@ async function main() {
 			assert.strictEqual(get("NOVO_MOTIVO").Tipo, "Sem mapeamento"); // sem nome: aparece cru
 			const daily = readAll(
 				file,
-				dashboardSql("Criado e destruído por dia — ${moeda} (período selecionado)", { from: 0, to })
+				dashboardSql("Criado, destruído e líquido por dia — ${moeda} (período selecionado)", {
+					from: 0,
+					to
+				})
 			);
-			assert.deepStrictEqual([daily[0]["Criado"], daily[0]["Destruído"]], [120, 35]);
+			// destruído abaixo de zero, líquido em linha
+			assert.deepStrictEqual(
+				[daily[0]["Criado"], daily[0]["Destruído"], daily[0]["Líquido"]],
+				[120, -35, 85]
+			);
 			const unk = readAll(
 				file,
 				dashboardSql("Motivos sem mapeamento (últimos 7 dias)", { from: 0, to })
@@ -1725,23 +2077,166 @@ async function main() {
 			);
 			// Nenhuma consulta do painel soma a linha non_monetary
 			for (const p of dashboardPanels()) {
-				if (!p.targets) continue;
+				if (!p.targets.length) continue;
 				const rows = readAll(file, dashboardSql(p.title, { from: 0, to }));
 				assert.ok(!JSON.stringify(rows).includes("99999"), `${p.title} somou non_monetary`);
 			}
 		});
 
-		await test("painel: estado com 4 painéis, seções recolhidas, colunas legíveis, período no título, padrão 7 dias", () => {
-			const dash = JSON.parse(fs.readFileSync(DASHBOARD, "utf8"));
-			assert.deepStrictEqual(dash.time, { from: "now-7d", to: "now" });
-			const top = dash.panels.filter((p) => p.type !== "row");
-			assert.strictEqual(top.length, 4, "tela de estado com 4 painéis");
-			const rows = dash.panels.filter((p) => p.type === "row");
-			assert.ok(
-				rows.slice(1).every((r) => r.collapsed && r.panels.length > 0),
-				"detalhes recolhidos"
+		await test("dashboards commitados = saída do gerador (observability/grafana/tools/mkdash.py)", () => {
+			const { spawnSync } = require("child_process");
+			const py = spawnSync("python3", ["--version"]);
+			if (py.error || py.status !== 0) {
+				console.warn("  (aviso: python3 ausente, comparação com o gerador pulada)");
+				return;
+			}
+			const out = fs.mkdtempSync(path.join(tmpRoot, "mkdash-"));
+			const gen = spawnSync(
+				"python3",
+				["-B", path.join(REPO_ROOT, "observability/grafana/tools/mkdash.py"), REPO_ROOT, out],
+				{ encoding: "utf8" }
 			);
-			for (const p of dashboardPanels().filter((x) => x.targets)) {
+			assert.strictEqual(gen.status, 0, gen.stderr);
+			for (const f of [
+				"dashboards/economia.json",
+				"dashboards/jogador.json",
+				"provisioning/alerting/economia.yaml"
+			]) {
+				const a = fs.readFileSync(path.join(REPO_ROOT, "observability/grafana", f));
+				const b = fs.readFileSync(path.join(out, "observability/grafana", f));
+				assert.ok(
+					a.equals(b),
+					`${f} difere da saída do gerador: rode python3 observability/grafana/tools/mkdash.py .`
+				);
+			}
+		});
+
+		await test("layout: nenhum painel sobrepõe outro, em toda grade dos dois dashboards", () => {
+			for (const file of [DASHBOARD, DASHBOARD_JOGADORES]) {
+				const grids = [];
+				const walk = (l, where) => {
+					if (!l || typeof l !== "object") return;
+					if (l.kind === "GridLayout") grids.push({ where, items: l.spec.items });
+					for (const t of l.spec?.tabs || []) walk(t.spec.layout, `${where} > ${t.spec.title}`);
+					for (const r of l.spec?.rows || []) walk(r.spec.layout, `${where} > ${r.spec.title}`);
+				};
+				walk(JSON.parse(fs.readFileSync(file, "utf8")).spec.layout, path.basename(file));
+				assert.ok(grids.length > 0);
+				for (const { where, items } of grids) {
+					for (let i = 0; i < items.length; i++) {
+						const a = items[i].spec;
+						assert.ok(
+							a.x >= 0 && a.x + a.width <= 24,
+							`${where}: ${a.element.name} fora da largura`
+						);
+						for (let j = i + 1; j < items.length; j++) {
+							const b = items[j].spec;
+							const cruza =
+								a.x < b.x + b.width &&
+								b.x < a.x + a.width &&
+								a.y < b.y + b.height &&
+								b.y < a.y + a.height;
+							assert.ok(!cruza, `${where}: ${a.element.name} sobrepõe ${b.element.name}`);
+						}
+					}
+				}
+			}
+		});
+
+		await test("painel: seis abas, Resumo numa tela, alma gêmea só com Zinthos, colunas legíveis, período no título, padrão 7 dias", () => {
+			const dash = JSON.parse(fs.readFileSync(DASHBOARD, "utf8"));
+			assert.strictEqual(dash.apiVersion, "dashboard.grafana.app/v2");
+			assert.strictEqual(dash.metadata.name, "ravena-economia");
+			assert.deepStrictEqual(
+				[dash.spec.timeSettings.from, dash.spec.timeSettings.to],
+				["now-7d", "now"]
+			);
+			const layout = dashboardLayout();
+			assert.deepStrictEqual(
+				layout.map((t) => t.title),
+				["Resumo", "Moeda", "Jogadores", "Atividade", "Mudanças", "Diagnóstico"]
+			);
+			const byName = new Map(dashboardPanels().map((p) => [p.name, p]));
+			// Resumo com uma escala (seções da massa só aparecem com a Escala delas)
+			const escalaDe = (s) => s.conditional?.spec.items[0].spec.value;
+			const resumoCom = (escala) =>
+				layout[0].sections.filter((s) => !s.conditional || escalaDe(s) === escala);
+			assert.deepStrictEqual(layout[0].sections.filter((s) => s.conditional).map(escalaDe), [
+				"indice",
+				"valor",
+				"separado"
+			]);
+			for (const escala of ["indice", "valor", "separado"]) {
+				const resumo = resumoCom(escala).flatMap((s) => s.elements.map((n) => byName.get(n)));
+				assert.deepStrictEqual(
+					resumo.filter((p) => p.type !== "text").map((p) => p.type),
+					["table", "alertlist", "timeseries", "table"],
+					"Resumo: situação por moeda, alertas, massa, mudanças"
+				);
+			}
+			// Resumo cabe em 1920×1080: cada linha da grade ocupa ~38 px reais (30 + espaço), ~22 linhas abaixo do topo
+			// (variáveis e abas)
+			const rows = dash.spec.layout.spec.tabs[0].spec.layout.spec.rows;
+			for (const escala of ["indice", "valor", "separado"]) {
+				const resumoH = rows
+					.filter(
+						(r) =>
+							!r.spec.conditionalRendering ||
+							r.spec.conditionalRendering.spec.items[0].spec.value === escala
+					)
+					.reduce(
+						(t, r) =>
+							t +
+							r.spec.layout.spec.items.reduce((m, i) => Math.max(m, i.spec.y + i.spec.height), 0),
+						0
+					);
+				assert.ok(resumoH <= 22, `Resumo (${escala}) com ${resumoH} linhas de grade`);
+			}
+			// Separado: um gráfico por moeda escolhida
+			const sep = rows.find(
+				(r) => r.spec.conditionalRendering?.spec.items[0].spec.value === "separado"
+			);
+			assert.strictEqual(sep.spec.layout.spec.items[0].spec.repeat.value, "moedas");
+			const alma = layout[1].sections.find((s) => s.title === "Ciclo da alma gêmea");
+			assert.deepStrictEqual(alma.conditional.spec.items[0].spec, {
+				variable: "moeda",
+				operator: "equals",
+				value: "zinthos"
+			});
+			// Estados vazios por renderização condicional (timeseries não mostra noValue): Petalitas sem fluxos, com aviso
+			const cond = (sec) => sec.conditional?.spec.items[0].spec;
+			const moedaTab = layout[1].sections;
+			assert.deepStrictEqual(cond(moedaTab.find((s) => s.title === "Fluxos — ${moeda}")), {
+				variable: "moeda",
+				operator: "notEquals",
+				value: "petalitas"
+			});
+			const aviso = moedaTab.find(
+				(s) => cond(s)?.value === "petalitas" && cond(s).operator === "equals"
+			);
+			assert.strictEqual(byName.get(aviso.elements[0]).title, "Petalitas: sem extrato (fase 2)");
+			// Ficha do jogador só com jogador escolhido; sem ele, a instrução
+			const jogSecs = dashboardLayout(DASHBOARD_JOGADORES)[0].sections;
+			assert.deepStrictEqual(
+				jogSecs.map((s) => cond(s) && [s.title, cond(s).operator, cond(s).value]).filter(Boolean),
+				[
+					["", "equals", ""],
+					["Jogador escolhido: ${nome} · ${jogador}", "notEquals", ""]
+				]
+			);
+			// Todo elemento do layout existe e todo elemento está no layout (uma vez)
+			const used = layout.flatMap((t) => t.sections.flatMap((s) => s.elements));
+			assert.deepStrictEqual([...used].sort(), [...byName.keys()].sort());
+			// Variáveis: moeda (uma), moedas (várias, todas marcadas) e escala
+			const vars = Object.fromEntries(dash.spec.variables.map((v) => [v.spec.name, v.spec]));
+			assert.strictEqual(vars.moeda.multi, false);
+			assert.strictEqual(vars.moedas.multi, true);
+			assert.deepStrictEqual(vars.moedas.current.value, ["zinthos", "petalitas", "runas"]);
+			assert.deepStrictEqual(
+				vars.escala.options.map((o) => o.value),
+				["indice", "valor", "separado"]
+			);
+			for (const p of dashboardPanels().filter((x) => x.targets.length)) {
 				const sql = p.targets[0].queryText;
 				for (const m of sql.matchAll(/ AS ([a-z_]+)\b/g)) {
 					assert.ok(
@@ -1792,14 +2287,51 @@ async function main() {
 							"des_d",
 							"des_d_tot",
 							"jog_a",
-							"jog_d_tot",
+							"jog_d",
+							"n",
 							"massa_na",
-							"massa_dep"
+							"massa_dep",
+							"id",
+							"origin",
+							"v",
+							"ruido",
+							"semanas",
+							"dcri",
+							"situacao",
+							"motivos",
+							"t0",
+							"n",
+							// situação por moeda (histórico de 8 semanas, carga)
+							...[
+								"so_k",
+								"cri_k",
+								"massa_k",
+								"max_sc",
+								"max_sm",
+								"carga",
+								"atraso",
+								"conh",
+								"late"
+							],
+							...["lv_so_bruto", "ev", "pz", "desde", "wq", "k", "massa_ant"],
+							// ranking da aba Jogadores (CTE internas)
+							...[
+								"cambio",
+								"destruido",
+								"liquido",
+								"m",
+								"mediana",
+								"nome",
+								"phone",
+								"saldo",
+								"tipos",
+								"transf"
+							]
 						].includes(m[1]),
 						`${p.title}: coluna em snake_case ${m[1]}`
 					);
 				}
-				if (!/Últimas mudanças|Confiança|Disponibilidade|Mudanças: ficha/.test(p.title)) {
+				if (!/Últimas mudanças|Confiança|Disponibilidade|Ficha de antes e depois/.test(p.title)) {
 					assert.match(
 						p.title,
 						/últimos 7 dias|12 semanas|período selecionado|retrato mais recente|últimas 50|agora/,
@@ -2145,7 +2677,7 @@ async function main() {
 		await test("todas as consultas do painel rodam no retrato publicado", () => {
 			let n = 0;
 			for (const p of dashboardPanels()) {
-				if (!p.targets) continue;
+				if (!p.targets.length) continue;
 				for (const moeda of ["zinthos", "petalitas", "runas"]) {
 					readAll(pubFile, dashboardSql(p.title, { from: DAY0 - 90 * D, to: clock, moeda }));
 				}
