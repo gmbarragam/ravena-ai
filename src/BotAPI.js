@@ -25,6 +25,10 @@ const {
 } = require("./BotAPI/middleware/auth");
 const { createRateLimiters } = require("./BotAPI/middleware/rateLimiters");
 const {
+	createFrameAncestorsGuard,
+	createSameOriginGuard
+} = require("./BotAPI/middleware/security");
+const {
 	upload,
 	uploadNsfw,
 	uploadsDir,
@@ -61,6 +65,7 @@ const registerEventsRoutes = require("./BotAPI/routes/eventsRoutes");
  * Arquitetura Modular:
  * - src/BotAPI/middleware/auth.js: Autenticação de admin, sessão via cookie, Basic Auth e UPS Secret
  * - src/BotAPI/middleware/rateLimiters.js: Limitadores de taxa geral e restrito
+ * - src/BotAPI/middleware/security.js: frame-ancestors e checagem de origem nas escritas
  * - src/BotAPI/middleware/upload.js: Configuração de upload via Multer (geral e fotos NSFW)
  * - src/BotAPI/services/analyticsHelper.js: Agregação analítica, estatísticas e cache de comandos
  * - src/BotAPI/services/webhookManager.js: Servidor de webhooks de grupos e fila de bufferização
@@ -102,6 +107,23 @@ class BotAPI {
 			})
 		);
 
+		// Só a própria origem pode pôr as páginas da Ravena num iframe
+		this.app.use(createFrameAncestorsGuard());
+
+		// Escritas com credencial de admin só da própria origem (CSRF). Webhooks e chamadas
+		// servidor a servidor não mandam Origin/Sec-Fetch-Site e passam como antes.
+		this.app.use(
+			createSameOriginGuard({
+				hasCredentials: (req) =>
+					Boolean(
+						getCookie(req, "ravena_admin_session") ||
+						req.headers.authorization ||
+						(req.query && req.query.auth)
+					),
+				logger: this.logger
+			})
+		);
+
 		// Injeta referência do botApi nos bots
 		this.bots.forEach((bot) => {
 			bot.botApi = this;
@@ -123,7 +145,10 @@ class BotAPI {
 		this.upsApiSecret = process.env.UPS_API_SECRET ?? false;
 
 		// Middlewares de rate limiting e upload
-		const { generalLimiter, strictLimiter } = createRateLimiters();
+		// O strictLimiter não conta requisições de admin autenticado (ver rateLimiters.js)
+		const { generalLimiter, strictLimiter } = createRateLimiters({
+			isAdmin: (req) => isAdmin(this, req)
+		});
 		this.generalLimiter = generalLimiter;
 		this.strictLimiter = strictLimiter;
 
@@ -232,6 +257,7 @@ class BotAPI {
 	 *    - GET  /                                  -> Homepage Desktop OS (redireciona/serve UI)
 	 *    - GET  /os, /os/*                         -> Interface Desktop OS
 	 *    - GET  /classic, /legado                  -> Dashboard clássico/legado
+	 *    - GET  /admin, /admin.html                -> Painel de admin unificado (experimental)
 	 *    - GET  /dashboard, /dashboard.html        -> Redirecionamento para /instances
 	 *    - GET  /logout                            -> Limpeza de cookie de sessão de admin
 	 *    - GET  /health                            -> Verificação de saúde em tempo real (RAM)

@@ -25,6 +25,7 @@ const storageService = require("../../services/StorageService");
  * - GET  /tts, /falar                 - Interface web de síntese de voz (TTS)
  * - GET  /pesca, /fishing             - Interface web do jogo de pesca
  * - GET  /status                      - Página pública de status das instâncias e canais de aviso
+ * - GET  /admin, /admin.html          - Painel de admin unificado (experimental, Basic Auth)
  * - GET  /waifuletes, /waifus         - Atalho para o app de Waifuletes na OS
  * - GET  /groups-dossier              - Visualizador HTML de dossiês de grupos
  * - GET  /service-providers           - Interface de gerenciamento de provedores de IA
@@ -36,6 +37,8 @@ const storageService = require("../../services/StorageService");
  */
 const PUBLIC_DIR = path.join(__dirname, "../../../public");
 const ONE_WEEK_SECONDS = 7 * 24 * 60 * 60;
+/** HTML do painel /admin, fora de public/ para só sair pela rota autenticada */
+const ADMIN_VIEW = path.join(__dirname, "../views/admin.html");
 
 /**
  * Política de cache dos arquivos estáticos (express.static):
@@ -139,6 +142,32 @@ function registerIndexRoutes(api) {
 		}
 		res.setHeader("Cache-Control", "no-cache");
 		res.sendFile(path.join(__dirname, "../../../public/status.html"));
+	});
+
+	// Painel de admin unificado (experimental). O HTML fica fora de public/ (em
+	// src/BotAPI/views), então só esta rota autenticada o entrega: caminhos codificados como
+	// /%61dmin.html ou //admin.html não chegam a ele pelo express.static. Os assets em
+	// public/admin/ continuam estáticos (não têm dados). As telas antigas seguem como estão.
+	app.get(["/admin", "/admin/", "/admin.html"], api.authenticateBasic, async (req, res) => {
+		if (api.isAdmin(req)) {
+			api.setAdminSessionCookie(res);
+		}
+		res.setHeader("Cache-Control", "no-cache");
+		try {
+			const rawHtml = await fs.readFile(ADMIN_VIEW, "utf-8");
+			const [vTokens, vCss, vJs] = await Promise.all([
+				assetVersion("admin/tokens.css"),
+				assetVersion("admin/admin.css"),
+				assetVersion("admin/admin.js")
+			]);
+			const html = rawHtml
+				.replace(/tokens\.css\?v=[^"']+/g, `tokens.css?v=${vTokens}`)
+				.replace(/admin\.css\?v=[^"']+/g, `admin.css?v=${vCss}`)
+				.replace(/admin\.js\?v=[^"']+/g, `admin.js?v=${vJs}`);
+			return res.type("html").send(html);
+		} catch {
+			return res.sendFile(ADMIN_VIEW);
+		}
 	});
 
 	// Entrega da interface Desktop OS como homepage principal (/)
